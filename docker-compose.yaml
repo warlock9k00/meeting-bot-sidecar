@@ -1,0 +1,16 @@
+services:
+  sidecar:
+    build: .
+    container_name: meeting-bot-sidecar
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - sidecar_tmp:/tmp/sidecar
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; print('ok')"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  sidecar_tmp:
