@@ -3,7 +3,14 @@ import os
 import time
 import logging
 import traceback
-from . import kv, processor
+import socket
+import urllib3.util.connection as urllib3_cn
+
+# Force IPv4 — наш CF API token имеет IP filter (только IPv4),
+# а Hetzner VPS по умолчанию резолвит IPv6 первым.
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+
+from . import kv, processor  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
