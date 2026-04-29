@@ -1,4 +1,13 @@
-"""Entry point: poll loop. Pulls pending jobs from CF KV, processes each."""
+"""Entry point: HTTP server (push) + slow polling (safety net).
+
+Architecture:
+  - Worker on Cloudflare receives Attendee webhook → puts job in KV → POSTs
+    /job to this sidecar with {bot_id} (Bearer SIDECAR_TOKEN).
+  - This server queues the bot_id and processes in a worker thread.
+  - A slow polling loop (default 5 min) catches anything the push missed
+    (transient HTTP errors, Worker downtime, etc.). 288 list-ops/day fits
+    well in CF KV free tier (1000/day limit).
+"""
 import os
 import time
 import logging
@@ -6,11 +15,10 @@ import traceback
 import socket
 import urllib3.util.connection as urllib3_cn
 
-# Force IPv4 — наш CF API token имеет IP filter (только IPv4),
-# а Hetzner VPS по умолчанию резолвит IPv6 первым.
+# Force IPv4 — наш CF API token имеет IP filter (только IPv4).
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
-from . import kv, processor  # noqa: E402
+from . import kv, server  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,36 +29,37 @@ log = logging.getLogger("sidecar")
 MAX_ATTEMPTS = 3
 
 
-def tick():
-    jobs = kv.list_pending_jobs()
+def safety_tick():
+    """Polled fallback: re-queue any pending jobs the push pipeline missed."""
+    try:
+        jobs = kv.list_pending_jobs()
+    except Exception as e:
+        log.error("safety poll list failed: %s", e)
+        return
     if not jobs:
         return
-    log.info("found %d pending jobs", len(jobs))
+    log.info("safety poll: found %d pending job(s)", len(jobs))
     for job in jobs:
         bot_id = job["bot_id"]
-        attempts = job.get("attempts", 0)
-        if attempts >= MAX_ATTEMPTS:
-            log.warning("skip %s — max attempts (%d) reached", bot_id, attempts)
+        if job.get("attempts", 0) >= MAX_ATTEMPTS:
+            log.warning("safety: skip %s — max attempts reached", bot_id)
             continue
-        try:
-            kv.mark_processing(bot_id, job)
-            result = processor.process_job(job)
-            kv.mark_done(bot_id, job, result)
-            log.info("job.done bot_id=%s sha=%s", bot_id, result.get("commit_sha"))
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            log.error("job.failed bot_id=%s err=%s\n%s", bot_id, err, traceback.format_exc())
-            kv.mark_failed(bot_id, job, err)
+        # Reuse the server's queue + dedup so a job won't be processed twice.
+        enqueued = server.enqueue(bot_id)
+        log.info("safety: enqueued bot_id=%s (was_inflight=%s)", bot_id, not enqueued)
 
 
 def main():
-    interval = int(os.environ.get("POLL_INTERVAL_SEC", "15"))
-    log.info("sidecar started, polling every %d sec", interval)
+    interval = int(os.environ.get("POLL_INTERVAL_SEC", "300"))  # 5 min default
+    log.info("sidecar starting: HTTP push + safety polling every %d sec", interval)
+
+    server.start_server_in_thread()
+
     while True:
         try:
-            tick()
+            safety_tick()
         except Exception as e:
-            log.error("tick failed: %s\n%s", e, traceback.format_exc())
+            log.error("safety tick failed: %s\n%s", e, traceback.format_exc())
         time.sleep(interval)
 
 

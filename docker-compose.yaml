@@ -4,10 +4,12 @@ services:
     container_name: meeting-bot-sidecar
     restart: unless-stopped
     env_file: .env
+    ports:
+      - "127.0.0.1:8082:8082"
     volumes:
       - sidecar_tmp:/tmp/sidecar
     healthcheck:
-      test: ["CMD", "python", "-c", "import os; print('ok')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/health', timeout=3)"]
       interval: 60s
       timeout: 5s
       retries: 3
