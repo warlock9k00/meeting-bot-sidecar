@@ -70,9 +70,13 @@ def process_job(job: dict) -> dict:
 
         # Mirror commit (used during Zoom Marketplace review so reviewers can
         # see real output without access to the operator's private vault).
+        # Privacy gate: only mirror when bot metadata says so. Worker sets
+        # mirror_to_review=true only when host_email matches the test account
+        # (e.g. support@context.select). Operator's own meetings stay private.
         mirror_repo = os.environ.get("MIRROR_REPO")
+        mirror_to_review = bool(bot.get("metadata", {}).get("mirror_to_review"))
         mirror_sha = None
-        if mirror_repo:
+        if mirror_repo and mirror_to_review:
             try:
                 mirror = github_commit.commit_file(
                     path_in_repo,
@@ -84,6 +88,8 @@ def process_job(job: dict) -> dict:
                 log.info("mirrored to %s: %s @ %s", mirror_repo, path_in_repo, mirror_sha)
             except Exception as e:
                 log.warning("mirror commit failed (non-fatal): %s", e)
+        elif mirror_repo:
+            log.info("mirror skipped (mirror_to_review=false) bot_id=%s", bot_id)
 
         return {
             "filename": filename,
