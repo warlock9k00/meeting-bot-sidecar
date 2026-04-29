@@ -68,9 +68,28 @@ def process_job(job: dict) -> dict:
         sha = commit.get("commit", {}).get("sha", "")[:8]
         log.info("committed: %s @ %s", path_in_repo, sha)
 
+        # Mirror commit (used during Zoom Marketplace review so reviewers can
+        # see real output without access to the operator's private vault).
+        mirror_repo = os.environ.get("MIRROR_REPO")
+        mirror_sha = None
+        if mirror_repo:
+            try:
+                mirror = github_commit.commit_file(
+                    path_in_repo,
+                    markdown,
+                    f"[meeting_ingest] {filename}",
+                    repo=mirror_repo,
+                )
+                mirror_sha = mirror.get("commit", {}).get("sha", "")[:8]
+                log.info("mirrored to %s: %s @ %s", mirror_repo, path_in_repo, mirror_sha)
+            except Exception as e:
+                log.warning("mirror commit failed (non-fatal): %s", e)
+
         return {
             "filename": filename,
             "commit_sha": sha,
+            "mirror_repo": mirror_repo,
+            "mirror_sha": mirror_sha,
             "size_mb_mp4": round(size_mb, 1),
             "size_mb_opus": round(opus_mb, 2),
             "segments": len(segments),

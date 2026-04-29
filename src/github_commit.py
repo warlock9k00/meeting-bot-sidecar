@@ -4,8 +4,9 @@ import base64
 import requests
 
 
-def commit_file(path_in_repo: str, content: str, message: str) -> dict:
-    repo = os.environ["GITHUB_REPO"]
+def commit_file(path_in_repo: str, content: str, message: str, repo: str | None = None) -> dict:
+    if repo is None:
+        repo = os.environ["GITHUB_REPO"]
     branch = os.environ.get("GITHUB_BRANCH", "main")
     token = os.environ["GITHUB_TOKEN"]
     api = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}"
