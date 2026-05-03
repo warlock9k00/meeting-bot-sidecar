@@ -74,7 +74,12 @@ def process_job(job: dict) -> dict:
         # mirror_to_review=true only when host_email matches the test account
         # (e.g. support@context.select). Operator's own meetings stay private.
         mirror_repo = os.environ.get("MIRROR_REPO")
-        mirror_to_review = bool(bot.get("metadata", {}).get("mirror_to_review"))
+        # Worker stores metadata as strings (Attendee constraint).
+        # Treat the literal string "true" as true; anything else (incl. "false",
+        # missing, empty) as false.
+        mirror_to_review = (
+            str(bot.get("metadata", {}).get("mirror_to_review", "")).lower() == "true"
+        )
         mirror_sha = None
         if mirror_repo and mirror_to_review:
             try:
