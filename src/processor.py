@@ -7,6 +7,19 @@ from . import attendee, groq_whisper, render, github_commit
 
 log = logging.getLogger(__name__)
 
+# Anything below this is an Attendee placeholder (~993 bytes empty mp4
+# container with no streams). Smallest legitimate recording ≥100 KB.
+EMPTY_MP4_THRESHOLD_BYTES = 10_000
+
+
+class EmptyRecordingError(Exception):
+    """Bot uploaded a placeholder mp4 with no actual audio. Don't retry."""
+    def __init__(self, size_bytes: int):
+        self.size_bytes = size_bytes
+        super().__init__(
+            f"empty mp4 placeholder ({size_bytes} bytes < {EMPTY_MP4_THRESHOLD_BYTES})"
+        )
+
 
 def process_job(job: dict) -> dict:
     """Process one job. Returns result dict for KV log. Raises on failure."""
@@ -34,8 +47,19 @@ def process_job(job: dict) -> dict:
             with open(mp4_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     f.write(chunk)
-        size_mb = os.path.getsize(mp4_path) / 1024 / 1024
-        log.info("downloaded mp4: %.1f MB", size_mb)
+        size_bytes = os.path.getsize(mp4_path)
+        size_mb = size_bytes / 1024 / 1024
+        log.info("downloaded mp4: %.1f MB (%d bytes)", size_mb, size_bytes)
+
+        # Empty-placeholder detection — Attendee uploads ~993-byte mp4 stubs
+        # when a bot joins but never captures audio (SDK error / fatal_error).
+        # Skip ffmpeg+whisper; mark distinctly so we don't waste 3 retries.
+        if size_bytes < EMPTY_MP4_THRESHOLD_BYTES:
+            log.warning(
+                "bot_id=%s empty placeholder mp4 (%d bytes), skipping pipeline",
+                bot_id, size_bytes,
+            )
+            raise EmptyRecordingError(size_bytes)
 
         # Convert
         subprocess.run(

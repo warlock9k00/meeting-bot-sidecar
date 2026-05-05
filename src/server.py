@@ -65,6 +65,9 @@ def _process_one(bot_id: str):
         result = processor.process_job(job)
         kv.mark_done(bot_id, job, result)
         log.info("job.done bot_id=%s sha=%s", bot_id, result.get("commit_sha"))
+    except processor.EmptyRecordingError as e:
+        log.warning("job.empty_recording bot_id=%s size=%d", bot_id, e.size_bytes)
+        kv.mark_empty_recording(bot_id, job, e.size_bytes)
     except Exception as e:
         import traceback
         err = f"{type(e).__name__}: {e}"

@@ -79,6 +79,16 @@ def mark_failed(bot_id: str, job: dict, error: str) -> None:
     put_job(bot_id, job)
 
 
+def mark_empty_recording(bot_id: str, job: dict, size_bytes: int) -> None:
+    """Bot uploaded an empty placeholder mp4 (Attendee fail mode where the
+    bot joined but never captured audio). Mark distinctly so we don't waste
+    retries and can audit how often this happens."""
+    job["status"] = "empty_recording"
+    job["empty_size_bytes"] = size_bytes
+    job["completed_at"] = _now()
+    put_job(bot_id, job)
+
+
 def delete_job(bot_id: str) -> None:
     url = f"{_base_url()}/values/{bot_id}"
     r = requests.delete(url, headers=_headers(), timeout=10)
