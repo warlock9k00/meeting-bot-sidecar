@@ -1,7 +1,13 @@
 FROM python:3.12-slim
 
+# build-essential — fallback для случая если pip нужно собрать
+# native extension у пакетов без wheel (rtms SDK имеет C код).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg ca-certificates git && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        ca-certificates \
+        git \
+        build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
