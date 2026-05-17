@@ -29,6 +29,13 @@ LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
 DEFAULT_TIMEOUT_SEC = 7200
 
+# Fail-fast on connection failure: rtms SDK raises errors in its event loop
+# thread, not in the calling thread — client.join() returns successfully even
+# when alloc/join actually failed. onAudioData fires every 20ms while the
+# stream is alive (regardless of silence vs speech), so 30s without frames
+# means the connection never established.
+INITIAL_AUDIO_TIMEOUT_SEC = 30
+
 
 class RtmsSession:
     """One Zoom RTMS stream — capture audio + speakers in memory."""
@@ -44,6 +51,7 @@ class RtmsSession:
         self.audio_chunks: list[bytes] = []
         self.speakers: list[dict] = []
         self.started_at: float = 0.0
+        self._first_audio_at: float | None = None
 
         self.client = rtms.Client()
         self._done = threading.Event()
@@ -66,6 +74,8 @@ class RtmsSession:
         def _on_audio(*args, **kwargs):
             for a in args:
                 if isinstance(a, (bytes, bytearray, memoryview)):
+                    if self._first_audio_at is None:
+                        self._first_audio_at = time.time()
                     self.audio_chunks.append(bytes(a))
                     return
 
@@ -91,10 +101,33 @@ class RtmsSession:
             self._done.set()
 
     def join_and_capture(self, timeout: int = DEFAULT_TIMEOUT_SEC) -> None:
-        """Join RTMS stream, block until onLeave or timeout."""
+        """Join RTMS stream, block until onLeave or timeout.
+
+        Raises RuntimeError if no audio arrives within INITIAL_AUDIO_TIMEOUT_SEC
+        — protects against silent SDK join failures (errors in event loop thread
+        don't propagate to caller). Without this check, a bad payload would
+        block for the full DEFAULT_TIMEOUT_SEC (2 hours).
+        """
         self._setup_callbacks()
         self.started_at = time.time()
         self.client.join(self.payload)
+
+        # Phase 1: liveness check — wait for first audio frame, early leave,
+        # or initial timeout. while-else: else runs only if loop exits via
+        # the condition (deadline passed), not via break.
+        deadline = self.started_at + INITIAL_AUDIO_TIMEOUT_SEC
+        while time.time() < deadline:
+            if self._first_audio_at is not None or self._done.is_set():
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(
+                f"no audio frames within {INITIAL_AUDIO_TIMEOUT_SEC}s after join "
+                f"— likely join failure (check SDK logs above for cause)"
+            )
+
+        # Phase 2: connection is alive — wait for natural end (onLeave) or
+        # absolute timeout for long meetings.
         self._done.wait(timeout=timeout)
 
     def finalize(self) -> dict:
