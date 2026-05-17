@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from queue import Queue
 from flask import Flask, request, jsonify
 
-from . import kv, processor
+from . import kv, processor, rtms_worker
 
 log = logging.getLogger("sidecar.server")
 
@@ -85,6 +85,51 @@ def enqueue(bot_id: str) -> bool:
     return True
 
 
+# ─── RTMS dispatch ────────────────────────────────────────────────────────────
+#
+# Unlike Attendee jobs (single-threaded FIFO via _job_queue), each RTMS job
+# runs in its own subprocess to isolate native SDK crashes. Concurrent
+# meetings (different rtms_stream_ids) run truly in parallel — one daemon
+# thread per stream manages its subprocess lifecycle.
+
+_rtms_inflight: set = set()
+_rtms_inflight_lock = threading.Lock()
+
+
+def enqueue_rtms_job(job: dict) -> bool:
+    """Spawn daemon thread to manage one RTMS subprocess.
+
+    Return False if a job for the same rtms_stream_id is already inflight
+    (idempotent — safety_tick may re-discover a job that's still processing).
+    """
+    stream_id = job.get("rtms_stream_id")
+    if not stream_id:
+        log.warning("rtms.enqueue.no_stream_id job=%s", job)
+        return False
+
+    with _rtms_inflight_lock:
+        if stream_id in _rtms_inflight:
+            return False
+        _rtms_inflight.add(stream_id)
+
+    def _runner():
+        try:
+            exit_code = rtms_worker.process_rtms_job_in_subprocess(job)
+            log.info("rtms.runner.done stream=%s exit_code=%s", stream_id, exit_code)
+        except Exception as e:
+            log.error("rtms.runner.exception stream=%s err=%s", stream_id, e)
+        finally:
+            with _rtms_inflight_lock:
+                _rtms_inflight.discard(stream_id)
+
+    threading.Thread(
+        target=_runner,
+        daemon=True,
+        name=f"rtms_runner:{stream_id}",
+    ).start()
+    return True
+
+
 # ─── Flask app ────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -96,6 +141,7 @@ def health():
         "ok": True,
         "queue_size": _job_queue.qsize(),
         "inflight": len(_inflight),
+        "rtms_inflight": len(_rtms_inflight),
         "ts": datetime.now(timezone.utc).isoformat(),
     })
 
