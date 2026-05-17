@@ -1,10 +1,24 @@
 """Cloudflare KV REST client.
 
-Job format в KV:
-  key   = bot_id  (строка)
-  value = JSON: {"bot_id": "...", "received_at": "...", "status": "pending|processing|done|failed"}
+Three key spaces share the MEETING_JOBS namespace:
 
-Sidecar polls list_keys → читает каждый со status=pending → processing → done.
+  1. Attendee jobs (legacy mp4 path)
+       key   = bot_<id>
+       value = {"bot_id": ..., "received_at": ..., "status": ...}
+
+  2. RTMS jobs (new realtime path; CF Worker writes these on
+     meeting.rtms_started webhook)
+       key   = job:rtms:<rtms_stream_id>
+       value = {"type": "rtms", "rtms_stream_id": ..., "meeting_uuid": ...,
+                "payload": <full Zoom payload for rtms.Client().join()>,
+                "received_at": ..., "status": ...}
+
+  3. Dedup keys (Worker-only; sidecar ignores)
+       key   = webhook_dedup:<...>
+       value = ISO timestamp string (TTL 300-600s)
+
+list_pending_jobs() and list_pending_rtms_jobs() use prefix filters at the
+API level so they only return their respective domain.
 """
 import os
 import json
@@ -22,8 +36,30 @@ def _headers():
 
 
 def list_pending_jobs(limit: int = 50) -> list[dict]:
-    """Return list of pending job dicts (status=pending or missing)."""
-    url = f"{_base_url()}/keys?limit={limit}"
+    """Return list of pending Attendee job dicts (status=pending or failed).
+
+    Filters at API level by prefix=bot_ so RTMS keys and dedup keys don't
+    leak into the legacy path (where callers expect job["bot_id"] to exist).
+    """
+    url = f"{_base_url()}/keys?prefix=bot_&limit={limit}"
+    r = requests.get(url, headers=_headers(), timeout=10)
+    r.raise_for_status()
+    keys = [k["name"] for k in r.json().get("result", [])]
+    jobs = []
+    for k in keys:
+        v = get_job(k)
+        if v and v.get("status", "pending") in ("pending", "failed"):
+            jobs.append(v)
+    return jobs
+
+
+def list_pending_rtms_jobs(limit: int = 50) -> list[dict]:
+    """Return list of pending RTMS job dicts (status=pending or failed).
+
+    Each job dict carries rtms_stream_id; the KV key is f"job:rtms:{stream_id}".
+    Reuse get_job/put_job/mark_* helpers with that key for state updates.
+    """
+    url = f"{_base_url()}/keys?prefix=job:rtms:&limit={limit}"
     r = requests.get(url, headers=_headers(), timeout=10)
     r.raise_for_status()
     keys = [k["name"] for k in r.json().get("result", [])]
