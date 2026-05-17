@@ -97,3 +97,113 @@ def render_source(
     )
 
     return frontmatter + body
+
+
+# ─── RTMS path ────────────────────────────────────────────────────────────────
+
+
+def _slug_meeting_uuid(uuid: str) -> str:
+    """Sanitize Zoom meeting_uuid for filesystem use.
+
+    Zoom UUIDs contain `/` and `=` (base64-like) which are invalid in paths
+    and inconvenient in URLs. Replace runs of non-alphanumeric chars with _
+    and trim edges.
+    """
+    return re.sub(r"[^a-zA-Z0-9-]+", "_", uuid).strip("_") or "unknown"
+
+
+def rtms_source_filename(date_str: str, meeting_uuid: str) -> str:
+    """RTMS path filename — always zoom (RTMS is Zoom-only)."""
+    return f"{date_str}-zoom-{_slug_meeting_uuid(meeting_uuid)}.md"
+
+
+def _speaker_for_segment(seg_start_abs: float, speakers: list[dict]) -> str:
+    """Find most-recent speaker event with ts <= seg_start_abs.
+
+    Speakers list must be sorted ascending by ts (RTMS callbacks fire in order).
+    Returns '?' if no speaker event preceded the segment (e.g. host monologue
+    before first speaker change, or speaker timeline empty).
+    """
+    name = "?"
+    for sp in speakers:
+        sp_ts = sp.get("ts")
+        if sp_ts is None:
+            continue
+        if sp_ts <= seg_start_abs:
+            name = sp.get("user_name") or sp.get("user_id") or "?"
+        else:
+            break
+    return name
+
+
+def render_rtms_source(
+    rtms_stream_id: str,
+    meeting_uuid: str,
+    segments,
+    speakers: list[dict],
+    started_at_unix: float,
+    duration_sec: float,
+) -> str:
+    """Render an RTMS-captured meeting as v2 source markdown.
+
+    Frontmatter mirrors the Attendee path (`render_source`) so vault tooling
+    treats them identically — except `bot_id` is replaced by `rtms_stream_id`
+    and `meeting_uuid` is added. Transcript lines use real speaker names from
+    the RTMS active-speaker timeline (vs `**Участник:**` placeholder in the
+    Attendee path).
+    """
+    started_dt = datetime.fromtimestamp(started_at_unix, tz=timezone.utc)
+    duration_min = max(1, round(duration_sec / 60))
+
+    date_part = started_dt.strftime("%Y-%m-%d")
+    time_human = started_dt.strftime("%H:%M")
+
+    unique_names = []
+    seen = set()
+    for sp in speakers:
+        n = sp.get("user_name")
+        if n and n not in seen:
+            seen.add(n)
+            unique_names.append(n)
+    participants_str = ", ".join(unique_names) if unique_names else "—"
+
+    fm_lines = [
+        "---",
+        "type: source",
+        "kind: zoom_transcript",
+        f"date: {date_part}",
+        "project: null",
+        "people: []",
+        f"duration_min: {duration_min}",
+        "platform: zoom",
+        f"rtms_stream_id: {rtms_stream_id}",
+        f"meeting_uuid: {yaml_string(meeting_uuid)}",
+        "source_pipeline: rtms",
+        "---",
+    ]
+    frontmatter = "\n".join(fm_lines) + "\n\n"
+
+    transcript_lines = []
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        seg_start = seg.get("start", 0)
+        seg_start_abs = started_at_unix + seg_start
+        speaker = _speaker_for_segment(seg_start_abs, speakers)
+        transcript_lines.append(
+            f"[{format_ts(seg_start)}] **{speaker}:** {text}"
+        )
+
+    body = (
+        f"# Meeting {date_part} {time_human}\n\n"
+        f"**Когда:** {date_part} {time_human} · "
+        f"**Длительность:** {duration_min} мин · "
+        f"**Платформа:** zoom (RTMS)\n"
+        f"**Участники:** {participants_str}\n\n"
+        f"## Транскрипт\n\n"
+        + "\n\n".join(transcript_lines)
+        + "\n"
+    )
+
+    return frontmatter + body
