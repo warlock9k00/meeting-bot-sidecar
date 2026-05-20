@@ -96,6 +96,37 @@ def _do_work(job: dict) -> dict:
         sha = commit.get("commit", {}).get("sha", "")[:8]
         log.info("rtms.committed path=%s sha=%s", path_in_repo, sha)
 
+        # Mirror commit для review-периода Zoom Marketplace. Worker устанавливает
+        # job["mirror_to_review"]="true" через env RTMS_REVIEW_MODE, чтобы
+        # reviewer мог видеть свои встречи в review repo. После approval —
+        # выключить (RTMS_REVIEW_MODE=false), и mirror перестанет писаться.
+        # Privacy gate identical to Attendee path (processor.py).
+        mirror_repo = os.environ.get("MIRROR_REPO")
+        mirror_to_review = (
+            str(job.get("mirror_to_review", "")).lower() == "true"
+        )
+        mirror_sha = None
+        if mirror_repo and mirror_to_review:
+            try:
+                mirror = github_commit.commit_file(
+                    path_in_repo,
+                    markdown,
+                    f"[meeting_ingest] {filename}",
+                    repo=mirror_repo,
+                )
+                mirror_sha = mirror.get("commit", {}).get("sha", "")[:8]
+                log.info(
+                    "rtms.mirrored to %s: %s @ %s",
+                    mirror_repo, path_in_repo, mirror_sha,
+                )
+            except Exception as e:
+                log.warning("rtms.mirror commit failed (non-fatal): %s", e)
+        elif mirror_repo:
+            log.info(
+                "rtms.mirror skipped (mirror_to_review=false) stream=%s",
+                rtms_stream_id,
+            )
+
         unique_speakers = len({
             s.get("user_name")
             for s in capture["speakers"]
@@ -104,6 +135,8 @@ def _do_work(job: dict) -> dict:
         return {
             "filename": filename,
             "commit_sha": sha,
+            "mirror_repo": mirror_repo,
+            "mirror_sha": mirror_sha,
             "segments": len(segments),
             "duration_sec": round(capture["duration_sec"], 1),
             "audio_bytes": capture["audio_bytes_count"],
