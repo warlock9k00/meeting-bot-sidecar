@@ -5,7 +5,8 @@ queues incoming jobs for async processing.
 
 Endpoints:
   GET  /health        — liveness probe
-  POST /job           — enqueue {bot_id} for processing (auth required)
+  POST /job           — enqueue Attendee {bot_id} for processing (auth required)
+  POST /job/rtms      — enqueue full RTMS job dict (auth required)
 """
 import os
 import threading
@@ -161,6 +162,42 @@ def job():
     enqueued = enqueue(bot_id)
     log.info("job.received bot_id=%s enqueued=%s", bot_id, enqueued)
     return jsonify({"ok": True, "bot_id": bot_id, "enqueued": enqueued}), 202
+
+
+@app.route("/job/rtms", methods=["POST"])
+def job_rtms():
+    """Push endpoint для RTMS jobs от Worker.
+
+    Body: полный job dict (то что Worker кладёт в KV) — содержит
+    rtms_stream_id, meeting_uuid, payload (signature + server_urls),
+    mirror_to_review. Принимаем целиком, не перечитываем из KV — это
+    избавляет sidecar от list/get операций на CF KV REST API (которые
+    имеют узкий free-tier лимит и однажды нас уже положили).
+
+    Polling-fallback (main.rtms_safety_tick) остаётся как safety net,
+    но при работающем push он почти всегда находит пустую очередь.
+    """
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {SIDECAR_TOKEN}"
+    if not SIDECAR_TOKEN or auth != expected:
+        return jsonify({"error": "unauthorized"}), 401
+
+    job = request.get_json(silent=True) or {}
+    stream_id = job.get("rtms_stream_id")
+    if not stream_id or not isinstance(stream_id, str):
+        return jsonify({"error": "missing or invalid rtms_stream_id"}), 400
+    if not job.get("meeting_uuid"):
+        return jsonify({"error": "missing meeting_uuid"}), 400
+    if not job.get("payload"):
+        return jsonify({"error": "missing payload (need signature + server_urls)"}), 400
+
+    enqueued = enqueue_rtms_job(job)
+    log.info("rtms.job.received stream=%s enqueued=%s", stream_id, enqueued)
+    return jsonify({
+        "ok": True,
+        "rtms_stream_id": stream_id,
+        "enqueued": enqueued,
+    }), 202
 
 
 def start_server_in_thread():
