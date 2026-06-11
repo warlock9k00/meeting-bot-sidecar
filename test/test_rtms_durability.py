@@ -84,6 +84,29 @@ def test_corrupted_marker_means_stage_not_done(tmp_path: Path):
     assert _read_marker(tmp_path, "transcript") is None
 
 
+def test_r2_backup_key_naming():
+    from src.r2_backup import backup_key
+
+    assert backup_key("2026-06-11", "abc123", ".ogg") == "rtms/2026-06-11/abc123.ogg"
+    # WAV-fallback сохраняет своё расширение
+    assert backup_key("2026-06-11", "abc123", ".wav") == "rtms/2026-06-11/abc123.wav"
+
+
+def test_r2_is_configured_requires_all_vars(monkeypatch):
+    from src.r2_backup import _REQUIRED_ENV, is_configured
+
+    for k in _REQUIRED_ENV:
+        monkeypatch.delenv(k, raising=False)
+    assert is_configured() is False
+
+    for k in _REQUIRED_ENV:
+        monkeypatch.setenv(k, "x")
+    assert is_configured() is True
+
+    monkeypatch.setenv("R2_BUCKET", "")
+    assert is_configured() is False
+
+
 def test_gc_removes_only_stale_dirs(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("src.rtms_worker.TMP_BASE", str(tmp_path))
     base = tmp_path / "rtms"

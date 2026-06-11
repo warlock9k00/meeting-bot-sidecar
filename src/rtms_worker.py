@@ -31,7 +31,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github_commit, kv, render
+from . import github_commit, kv, r2_backup, render
 from .groq_whisper import default_meeting_prompt, transcribe
 
 log = logging.getLogger(__name__)
@@ -129,6 +129,29 @@ def _do_work(job: dict) -> dict:
             "rtms.resume stream=%s — захват уже на диске (%.1fs), пропускаю join",
             rtms_stream_id, capture["duration_sec"],
         )
+
+    # ── Стадия 1.5: R2-бэкап сжатого аудио ДО транскрипции. Best-effort:
+    # фейл не блокирует pipeline (первичный артефакт — локальный диск),
+    # но переживает смерть VPS целиком. ──
+    if _read_marker(output_dir, "upload") is None and r2_backup.is_configured():
+        try:
+            audio_path = capture["audio_for_whisper"]
+            date_str = datetime.fromtimestamp(
+                capture["started_at"], tz=timezone.utc
+            ).strftime("%Y-%m-%d")
+            key = r2_backup.backup_key(
+                date_str, rtms_stream_id, Path(audio_path).suffix
+            )
+            upload_meta = r2_backup.upload(audio_path, key)
+            _write_marker(output_dir, "upload", upload_meta)
+            log.info(
+                "rtms.backed_up r2://%s/%s (%d bytes)",
+                upload_meta["bucket"], key, upload_meta["size_bytes"],
+            )
+        except Exception as e:
+            log.warning("rtms.r2_backup failed (non-fatal): %s", e)
+    elif not r2_backup.is_configured():
+        log.info("rtms.r2_backup skipped (R2_* env not configured)")
 
     # ── Стадия 2: транскрипция (результат кэшируется на диск) ──
     whisper = _read_marker(output_dir, "transcript")
