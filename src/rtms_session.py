@@ -1,10 +1,11 @@
 """RTMS session — capture audio + speaker timeline from one Zoom RTMS stream.
 
 Wraps native zoom/rtms SDK with synchronous join_and_capture() API. Audio
-buffered in memory as raw PCM 16kHz mono int16 LE; speaker events collected
-with absolute timestamps. On onLeave or timeout, finalize() encodes WAV +
-runs ffmpeg loudnorm, returning paths + speaker timeline for downstream
-alignment with Whisper segments.
+стримится на диск инкрементально (raw PCM 16kHz mono int16 LE) — краш
+процесса посреди встречи теряет максимум несколько секунд звука, а не всю
+встречу. Speaker events collected with absolute timestamps. On onLeave or
+timeout, finalize() encodes WAV + runs ffmpeg loudnorm, returning paths +
+speaker timeline for downstream alignment with Whisper segments.
 
 SDK occasionally segfaults — callers should run each session in a subprocess
 (see rtms_worker.py) for crash isolation.
@@ -16,12 +17,14 @@ import time
 import wave
 from pathlib import Path
 
-import rtms
-
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_FRAME_SIZE = 320  # 16000 Hz × 20ms × mono
 AUDIO_DURATION_MS = 20
+
+# Кадры приходят каждые 20 мс → 50 кадров/сек. Flush на диск каждые 250
+# кадров (~5 сек): при краше процесса теряем максимум 5 секунд звука.
+FLUSH_EVERY_FRAMES = 250
 
 # Broadcast loudness normalization (EBU R128) — critically boosts quiet
 # recordings before Whisper. PoC: avg volume 1.44% → 4.55% on test meeting.
@@ -37,10 +40,26 @@ DEFAULT_TIMEOUT_SEC = 7200
 INITIAL_AUDIO_TIMEOUT_SEC = 30
 
 
+def pcm_to_wav(pcm_path: Path, wav_path: Path) -> None:
+    """Stream-конвертация raw PCM → WAV чанками — часы аудио не грузим в RAM."""
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(AUDIO_SAMPLE_RATE)
+        with pcm_path.open("rb") as src:
+            while chunk := src.read(1 << 20):
+                wf.writeframes(chunk)
+
+
 class RtmsSession:
-    """One Zoom RTMS stream — capture audio + speakers in memory."""
+    """One Zoom RTMS stream — capture audio + speakers, стримя PCM на диск."""
 
     def __init__(self, payload: dict, output_dir: Path):
+        # Lazy import: native SDK не нужен для импорта модуля (тесты helpers
+        # гоняются без установленного rtms-пакета).
+        import rtms
+
+        self._rtms = rtms
         self.payload = payload
         self.rtms_stream_id = (
             payload.get("rtms_stream_id") or payload.get("meeting_uuid", "unknown")
@@ -48,7 +67,12 @@ class RtmsSession:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.audio_chunks: list[bytes] = []
+        self.pcm_path = self.output_dir / "raw_audio.pcm"
+        self._pcm_file = self.pcm_path.open("wb")
+        self._pcm_lock = threading.Lock()
+        self.audio_bytes_count = 0
+        self._frames_since_flush = 0
+
         self.speakers: list[dict] = []
         self.started_at: float = 0.0
         self._first_audio_at: float | None = None
@@ -57,6 +81,7 @@ class RtmsSession:
         self._done = threading.Event()
 
     def _setup_callbacks(self):
+        rtms = self._rtms
         audio_params = rtms.AudioParams(
             content_type=rtms.AudioContentType["RAW_AUDIO"],
             codec=rtms.AudioCodec["L16"],
@@ -74,9 +99,18 @@ class RtmsSession:
         def _on_audio(*args, **kwargs):
             for a in args:
                 if isinstance(a, (bytes, bytearray, memoryview)):
-                    if self._first_audio_at is None:
-                        self._first_audio_at = time.time()
-                    self.audio_chunks.append(bytes(a))
+                    data = bytes(a)
+                    with self._pcm_lock:
+                        if self._pcm_file.closed:
+                            return
+                        if self._first_audio_at is None:
+                            self._first_audio_at = time.time()
+                        self._pcm_file.write(data)
+                        self.audio_bytes_count += len(data)
+                        self._frames_since_flush += 1
+                        if self._frames_since_flush >= FLUSH_EVERY_FRAMES:
+                            self._pcm_file.flush()
+                            self._frames_since_flush = 0
                     return
 
         @self.client.onActiveSpeakerEvent
@@ -131,18 +165,17 @@ class RtmsSession:
         self._done.wait(timeout=timeout)
 
     def finalize(self) -> dict:
-        """Encode captured PCM → WAV → loudnorm WAV. Falls back to raw WAV
+        """Закрыть PCM-файл, encode WAV → loudnorm WAV. Falls back to raw WAV
         if ffmpeg is missing or fails."""
-        audio_bytes = b"".join(self.audio_chunks)
-        pcm_path = self.output_dir / "raw_audio.pcm"
-        pcm_path.write_bytes(audio_bytes)
+        with self._pcm_lock:
+            if not self._pcm_file.closed:
+                self._pcm_file.flush()
+                self._pcm_file.close()
+
+        audio_bytes_count = self.pcm_path.stat().st_size
 
         wav_path = self.output_dir / "audio.wav"
-        with wave.open(str(wav_path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(AUDIO_SAMPLE_RATE)
-            wf.writeframes(audio_bytes)
+        pcm_to_wav(self.pcm_path, wav_path)
 
         normalized_wav_path = self.output_dir / "audio_normalized.wav"
         try:
@@ -164,10 +197,10 @@ class RtmsSession:
             "rtms_stream_id": self.rtms_stream_id,
             "wav_path": str(wav_path),
             "wav_for_whisper": str(wav_for_whisper),
-            "pcm_path": str(pcm_path),
+            "pcm_path": str(self.pcm_path),
             "speakers_path": str(speakers_path),
             "speakers": self.speakers,
             "started_at": self.started_at,
-            "audio_bytes_count": len(audio_bytes),
-            "duration_sec": len(audio_bytes) / (AUDIO_SAMPLE_RATE * 2),
+            "audio_bytes_count": audio_bytes_count,
+            "duration_sec": audio_bytes_count / (AUDIO_SAMPLE_RATE * 2),
         }
