@@ -1,4 +1,15 @@
-"""RTMS job orchestrator — RtmsSession → Whisper → render → GitHub commit.
+"""RTMS job orchestrator — staged pipeline с durable artifacts.
+
+Стадии: захват → транскрипция → render+commit. Каждая стадия оставляет
+marker-файл (capture.json, transcript.json) в каталоге артефактов; при
+ретрае или рестарте контейнера выполнение продолжается с первой
+непройденной стадии. Захват НЕ повторяется если capture.json есть —
+встреча уже закончилась, пере-джойн бессмысленен (исторически давал
+«no audio frames within 30s» × 3 и терял запись навсегда).
+
+Артефакты удаляются ТОЛЬКО при полном успехе. При фейле каталог остаётся
+для resume/ручного спасения; gc_stale_artifacts() подчищает через 7 дней
+(синхронно с lifecycle R2-бакета).
 
 Native zoom/rtms SDK occasionally segfaults on edge cases. To prevent one
 crash from taking down the whole sidecar, each RTMS job runs in its own
@@ -7,12 +18,15 @@ directly (done or failed). The parent only handles the timeout/kill case.
 
 Public API:
   process_rtms_job_in_subprocess(job) -> int  # returns exit code
+  gc_stale_artifacts() -> int                 # удалено каталогов
 """
+import json
 import logging
 import multiprocessing
 import os
 import shutil
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,25 +46,73 @@ SUBPROCESS_OVERHEAD_SEC = 600
 
 TMP_BASE = os.environ.get("TMP_DIR", "/tmp/sidecar")
 
+# Каталоги фейлов живут неделю — достаточно для ручного спасения,
+# синхронно с 7-дневным lifecycle R2-бакета meeting-audio-backup.
+GC_MAX_AGE_DAYS = 7
+
+
+def _marker_path(output_dir: Path, name: str) -> Path:
+    return output_dir / f"{name}.json"
+
+
+def _read_marker(output_dir: Path, name: str) -> dict | None:
+    p = _marker_path(output_dir, name)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        # Битый маркер (краш посреди записи) = стадия не пройдена.
+        return None
+
+
+def _write_marker(output_dir: Path, name: str, data: dict) -> None:
+    # Atomic write: tmp + rename — краш посреди записи не оставит битый маркер.
+    p = _marker_path(output_dir, name)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False))
+    tmp.replace(p)
+
+
+def gc_stale_artifacts() -> int:
+    """Удалить каталоги артефактов старше GC_MAX_AGE_DAYS. Возвращает число."""
+    base = Path(TMP_BASE) / "rtms"
+    if not base.exists():
+        return 0
+    cutoff = time.time() - GC_MAX_AGE_DAYS * 86400
+    removed = 0
+    for d in base.iterdir():
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        log.info("rtms.gc removed %d stale artifact dir(s)", removed)
+    return removed
+
 
 def _do_work(job: dict) -> dict:
-    """Run the full RTMS pipeline. Raises on any failure — caller catches.
+    """Run the staged RTMS pipeline. Raises on any failure — caller catches.
 
     Returns result dict suitable for kv.mark_done().
     """
-    # Lazy import — `rtms` native package not in requirements before C11,
-    # and we want rtms_worker importable for testing/dispatch even without it.
-    from .rtms_session import RtmsSession
-
     rtms_stream_id = job["rtms_stream_id"]
     meeting_uuid = job["meeting_uuid"]
-    payload = job["payload"]
 
     output_dir = Path(TMP_BASE) / "rtms" / rtms_stream_id
     log.info("rtms.job.start stream=%s uuid=%s", rtms_stream_id, meeting_uuid)
 
-    try:
-        session = RtmsSession(payload, output_dir)
+    # ── Стадия 1: захват. При resume пропускается целиком — встреча уже
+    # закончилась, пере-джойн даёт только «no audio frames within 30s». ──
+    capture = _read_marker(output_dir, "capture")
+    if capture is None:
+        # Lazy import — native rtms package нужен только для живого захвата;
+        # resume-путь и тесты работают без него.
+        from .rtms_session import RtmsSession
+
+        session = RtmsSession(job["payload"], output_dir)
         session.join_and_capture(timeout=DEFAULT_TIMEOUT_SEC)
         capture = session.finalize()
         log.info(
@@ -59,93 +121,107 @@ def _do_work(job: dict) -> dict:
             capture["duration_sec"],
             len(capture["speakers"]),
         )
-
         if capture["audio_bytes_count"] == 0:
             raise RuntimeError("no audio captured (empty session)")
+        _write_marker(output_dir, "capture", capture)
+    else:
+        log.info(
+            "rtms.resume stream=%s — захват уже на диске (%.1fs), пропускаю join",
+            rtms_stream_id, capture["duration_sec"],
+        )
 
+    # ── Стадия 2: транскрипция (результат кэшируется на диск) ──
+    whisper = _read_marker(output_dir, "transcript")
+    if whisper is None:
         whisper = transcribe(
             capture["audio_for_whisper"],
             language="ru",
             prompt=default_meeting_prompt(),
         )
-        segments = whisper.get("segments", [])
-        log.info(
-            "rtms.transcribed segments=%d chars=%d",
-            len(segments),
-            len(whisper.get("text", "")),
-        )
+        _write_marker(output_dir, "transcript", whisper)
+    segments = whisper.get("segments", [])
+    log.info(
+        "rtms.transcribed segments=%d chars=%d",
+        len(segments),
+        len(whisper.get("text", "")),
+    )
 
-        started_at_unix = capture["started_at"]
-        date_str = datetime.fromtimestamp(started_at_unix, tz=timezone.utc).strftime("%Y-%m-%d")
+    # ── Стадия 3: render + commit. Идемпотентна — повторный commit того же
+    # path перезаписывает файл тем же контентом, маркер не нужен. ──
+    started_at_unix = capture["started_at"]
+    date_str = datetime.fromtimestamp(started_at_unix, tz=timezone.utc).strftime("%Y-%m-%d")
 
-        markdown = render.render_rtms_source(
-            rtms_stream_id=rtms_stream_id,
-            meeting_uuid=meeting_uuid,
-            segments=segments,
-            speakers=capture["speakers"],
-            started_at_unix=started_at_unix,
-            duration_sec=capture["duration_sec"],
-        )
-        filename = render.rtms_source_filename(date_str, meeting_uuid)
-        sources_folder = os.environ.get("SOURCES_FOLDER", "sources")
-        path_in_repo = f"{sources_folder}/{filename}"
+    markdown = render.render_rtms_source(
+        rtms_stream_id=rtms_stream_id,
+        meeting_uuid=meeting_uuid,
+        segments=segments,
+        speakers=capture["speakers"],
+        started_at_unix=started_at_unix,
+        duration_sec=capture["duration_sec"],
+    )
+    filename = render.rtms_source_filename(date_str, meeting_uuid)
+    sources_folder = os.environ.get("SOURCES_FOLDER", "sources")
+    path_in_repo = f"{sources_folder}/{filename}"
 
-        commit = github_commit.commit_file(
-            path_in_repo, markdown, f"[meeting_ingest] {filename}"
-        )
-        sha = commit.get("commit", {}).get("sha", "")[:8]
-        log.info("rtms.committed path=%s sha=%s", path_in_repo, sha)
+    commit = github_commit.commit_file(
+        path_in_repo, markdown, f"[meeting_ingest] {filename}"
+    )
+    sha = commit.get("commit", {}).get("sha", "")[:8]
+    log.info("rtms.committed path=%s sha=%s", path_in_repo, sha)
 
-        # Mirror commit для review-периода Zoom Marketplace. Worker устанавливает
-        # job["mirror_to_review"]="true" через env RTMS_REVIEW_MODE, чтобы
-        # reviewer мог видеть свои встречи в review repo. После approval —
-        # выключить (RTMS_REVIEW_MODE=false), и mirror перестанет писаться.
-        # Privacy gate identical to Attendee path (processor.py).
-        mirror_repo = os.environ.get("MIRROR_REPO")
-        mirror_to_review = (
-            str(job.get("mirror_to_review", "")).lower() == "true"
-        )
-        mirror_sha = None
-        if mirror_repo and mirror_to_review:
-            try:
-                mirror = github_commit.commit_file(
-                    path_in_repo,
-                    markdown,
-                    f"[meeting_ingest] {filename}",
-                    repo=mirror_repo,
-                )
-                mirror_sha = mirror.get("commit", {}).get("sha", "")[:8]
-                log.info(
-                    "rtms.mirrored to %s: %s @ %s",
-                    mirror_repo, path_in_repo, mirror_sha,
-                )
-            except Exception as e:
-                log.warning("rtms.mirror commit failed (non-fatal): %s", e)
-        elif mirror_repo:
-            log.info(
-                "rtms.mirror skipped (mirror_to_review=false) stream=%s",
-                rtms_stream_id,
+    # Mirror commit для review-периода Zoom Marketplace. Worker устанавливает
+    # job["mirror_to_review"]="true" через env RTMS_REVIEW_MODE, чтобы
+    # reviewer мог видеть свои встречи в review repo. После approval —
+    # выключить (RTMS_REVIEW_MODE=false), и mirror перестанет писаться.
+    # Privacy gate identical to Attendee path (processor.py).
+    mirror_repo = os.environ.get("MIRROR_REPO")
+    mirror_to_review = (
+        str(job.get("mirror_to_review", "")).lower() == "true"
+    )
+    mirror_sha = None
+    if mirror_repo and mirror_to_review:
+        try:
+            mirror = github_commit.commit_file(
+                path_in_repo,
+                markdown,
+                f"[meeting_ingest] {filename}",
+                repo=mirror_repo,
             )
+            mirror_sha = mirror.get("commit", {}).get("sha", "")[:8]
+            log.info(
+                "rtms.mirrored to %s: %s @ %s",
+                mirror_repo, path_in_repo, mirror_sha,
+            )
+        except Exception as e:
+            log.warning("rtms.mirror commit failed (non-fatal): %s", e)
+    elif mirror_repo:
+        log.info(
+            "rtms.mirror skipped (mirror_to_review=false) stream=%s",
+            rtms_stream_id,
+        )
 
-        unique_speakers = len({
-            s.get("user_name")
-            for s in capture["speakers"]
-            if s.get("user_name")
-        })
-        return {
-            "filename": filename,
-            "commit_sha": sha,
-            "mirror_repo": mirror_repo,
-            "mirror_sha": mirror_sha,
-            "segments": len(segments),
-            "duration_sec": round(capture["duration_sec"], 1),
-            "audio_bytes": capture["audio_bytes_count"],
-            "speakers_count": unique_speakers,
-        }
-    finally:
-        # Disk economy on Hetzner cx23 — meetings produce ~10-100 MB raw PCM.
-        # Logs retain stream_id for post-mortem; transcript is in GitHub.
-        shutil.rmtree(output_dir, ignore_errors=True)
+    unique_speakers = len({
+        s.get("user_name")
+        for s in capture["speakers"]
+        if s.get("user_name")
+    })
+    result = {
+        "filename": filename,
+        "commit_sha": sha,
+        "mirror_repo": mirror_repo,
+        "mirror_sha": mirror_sha,
+        "segments": len(segments),
+        "duration_sec": round(capture["duration_sec"], 1),
+        "audio_bytes": capture["audio_bytes_count"],
+        "speakers_count": unique_speakers,
+    }
+
+    # Единственное место удаления артефактов — полный успех. При фейле
+    # каталог остаётся для resume/ручного спасения (GC подчистит через
+    # GC_MAX_AGE_DAYS). Disk economy: успешная встреча — это ~10-100 MB
+    # PCM, которые больше не нужны (транскрипт в GitHub).
+    shutil.rmtree(output_dir, ignore_errors=True)
+    return result
 
 
 def _worker_main(job: dict):

@@ -90,7 +90,10 @@ class RtmsSession:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.pcm_path = self.output_dir / "raw_audio.pcm"
-        self._pcm_file = self.pcm_path.open("wb")
+        # Append: если SDK сегфолтнулся посреди живой встречи и ретрай
+        # пере-джойнится, частичная запись первой попытки сохраняется
+        # (склейка с дырой лучше, чем потеря начала встречи).
+        self._pcm_file = self.pcm_path.open("ab")
         self._pcm_lock = threading.Lock()
         self.audio_bytes_count = 0
         self._frames_since_flush = 0

@@ -2,6 +2,9 @@
 import wave
 from pathlib import Path
 
+import os
+import time
+
 import pytest
 
 from src.groq_whisper import MAX_UPLOAD_BYTES, transcribe
@@ -10,6 +13,12 @@ from src.rtms_session import (
     OPUS_BITRATE,
     build_compress_cmd,
     pcm_to_wav,
+)
+from src.rtms_worker import (
+    GC_MAX_AGE_DAYS,
+    _read_marker,
+    _write_marker,
+    gc_stale_artifacts,
 )
 
 
@@ -57,3 +66,37 @@ def test_transcribe_rejects_oversized_file(tmp_path: Path):
 
     with pytest.raises(ValueError, match="exceeds Groq upload limit"):
         transcribe(str(big))
+
+
+def test_marker_roundtrip(tmp_path: Path):
+    assert _read_marker(tmp_path, "capture") is None
+
+    data = {"duration_sec": 12.5, "speakers": [{"user_name": "Алекс"}]}
+    _write_marker(tmp_path, "capture", data)
+
+    assert _read_marker(tmp_path, "capture") == data
+    # tmp-файл атомарной записи не должен оставаться
+    assert not (tmp_path / "capture.json.tmp").exists()
+
+
+def test_corrupted_marker_means_stage_not_done(tmp_path: Path):
+    (tmp_path / "transcript.json").write_text("{обрезанный json")
+    assert _read_marker(tmp_path, "transcript") is None
+
+
+def test_gc_removes_only_stale_dirs(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("src.rtms_worker.TMP_BASE", str(tmp_path))
+    base = tmp_path / "rtms"
+
+    stale = base / "old-stream"
+    stale.mkdir(parents=True)
+    (stale / "raw_audio.pcm").write_bytes(b"x")
+    old = time.time() - (GC_MAX_AGE_DAYS + 1) * 86400
+    os.utime(stale, (old, old))
+
+    fresh = base / "fresh-stream"
+    fresh.mkdir(parents=True)
+
+    assert gc_stale_artifacts() == 1
+    assert not stale.exists()
+    assert fresh.exists()

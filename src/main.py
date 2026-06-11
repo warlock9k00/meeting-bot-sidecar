@@ -18,7 +18,7 @@ import urllib3.util.connection as urllib3_cn
 # Force IPv4 — наш CF API token имеет IP filter (только IPv4).
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
-from . import kv, server  # noqa: E402
+from . import kv, rtms_worker, server  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +84,7 @@ def main():
         try:
             safety_tick()
             rtms_safety_tick()
+            rtms_worker.gc_stale_artifacts()
         except Exception as e:
             log.error("safety tick failed: %s\n%s", e, traceback.format_exc())
         time.sleep(interval)
