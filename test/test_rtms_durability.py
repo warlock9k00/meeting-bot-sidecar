@@ -2,7 +2,15 @@
 import wave
 from pathlib import Path
 
-from src.rtms_session import pcm_to_wav, AUDIO_SAMPLE_RATE
+import pytest
+
+from src.groq_whisper import MAX_UPLOAD_BYTES, transcribe
+from src.rtms_session import (
+    AUDIO_SAMPLE_RATE,
+    OPUS_BITRATE,
+    build_compress_cmd,
+    pcm_to_wav,
+)
 
 
 def test_pcm_to_wav_roundtrip(tmp_path: Path):
@@ -29,3 +37,23 @@ def test_pcm_to_wav_empty(tmp_path: Path):
 
     with wave.open(str(wav), "rb") as wf:
         assert wf.getnframes() == 0
+
+
+def test_build_compress_cmd_flags(tmp_path: Path):
+    cmd = build_compress_cmd(tmp_path / "raw.pcm", tmp_path / "audio.ogg")
+    # raw PCM требует явного формата на входе
+    assert ["-f", "s16le"] == cmd[cmd.index("-f"):cmd.index("-f") + 2]
+    assert "libopus" in cmd
+    assert OPUS_BITRATE in cmd
+    assert "loudnorm" in " ".join(cmd)
+    assert cmd[-1].endswith("audio.ogg")
+
+
+def test_transcribe_rejects_oversized_file(tmp_path: Path):
+    big = tmp_path / "big.ogg"
+    # sparse-файл: размер больше лимита без записи реальных байтов
+    with big.open("wb") as f:
+        f.truncate(MAX_UPLOAD_BYTES + 1)
+
+    with pytest.raises(ValueError, match="exceeds Groq upload limit"):
+        transcribe(str(big))

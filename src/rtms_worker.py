@@ -64,7 +64,7 @@ def _do_work(job: dict) -> dict:
             raise RuntimeError("no audio captured (empty session)")
 
         whisper = transcribe(
-            capture["wav_for_whisper"],
+            capture["audio_for_whisper"],
             language="ru",
             prompt=default_meeting_prompt(),
         )

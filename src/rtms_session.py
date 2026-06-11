@@ -30,6 +30,16 @@ FLUSH_EVERY_FRAMES = 250
 # recordings before Whisper. PoC: avg volume 1.44% → 4.55% on test meeting.
 LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
+# Opus 16 kbps mono ≈ 7 MB/час. Час несжатого PCM ≈ 115 MB и не влезает в
+# лимит Groq на файл (25 MB) — главный исторический убийца длинных встреч
+# (HTTP 413 Payload Too Large, 26 потерянных записей за май–июнь 2026).
+OPUS_BITRATE = "16k"
+
+# Таймаут компрессии: база + длительность/фактор. loudnorm+opus работает
+# ~30-60× realtime на cx23, фактор 10 даёт многократный запас.
+COMPRESS_TIMEOUT_BASE_SEC = 120
+COMPRESS_SPEED_FACTOR = 10
+
 DEFAULT_TIMEOUT_SEC = 7200
 
 # Fail-fast on connection failure: rtms SDK raises errors in its event loop
@@ -49,6 +59,18 @@ def pcm_to_wav(pcm_path: Path, wav_path: Path) -> None:
         with pcm_path.open("rb") as src:
             while chunk := src.read(1 << 20):
                 wf.writeframes(chunk)
+
+
+def build_compress_cmd(pcm_path: Path, ogg_path: Path) -> list[str]:
+    """ffmpeg: raw PCM → loudnorm → Opus 16 kbps mono, один проход."""
+    return [
+        "ffmpeg", "-y",
+        "-f", "s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
+        "-i", str(pcm_path),
+        "-af", LOUDNORM_FILTER,
+        "-c:a", "libopus", "-b:a", OPUS_BITRATE,
+        str(ogg_path),
+    ]
 
 
 class RtmsSession:
@@ -165,42 +187,42 @@ class RtmsSession:
         self._done.wait(timeout=timeout)
 
     def finalize(self) -> dict:
-        """Закрыть PCM-файл, encode WAV → loudnorm WAV. Falls back to raw WAV
-        if ffmpeg is missing or fails."""
+        """Закрыть PCM-файл, сжать в Opus (loudnorm + 16k mono) для Whisper.
+        Fallback на plain WAV если ffmpeg недоступен или упал."""
         with self._pcm_lock:
             if not self._pcm_file.closed:
                 self._pcm_file.flush()
                 self._pcm_file.close()
 
         audio_bytes_count = self.pcm_path.stat().st_size
+        duration_sec = audio_bytes_count / (AUDIO_SAMPLE_RATE * 2)
 
-        wav_path = self.output_dir / "audio.wav"
-        pcm_to_wav(self.pcm_path, wav_path)
-
-        normalized_wav_path = self.output_dir / "audio_normalized.wav"
+        ogg_path = self.output_dir / "audio.ogg"
+        timeout = COMPRESS_TIMEOUT_BASE_SEC + int(duration_sec / COMPRESS_SPEED_FACTOR)
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-i", str(wav_path),
-                 "-af", LOUDNORM_FILTER,
-                 "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
-                 str(normalized_wav_path)],
-                check=True, capture_output=True, timeout=60,
+                build_compress_cmd(self.pcm_path, ogg_path),
+                check=True, capture_output=True, timeout=timeout,
             )
-            wav_for_whisper = normalized_wav_path
+            audio_for_whisper = ogg_path
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-            wav_for_whisper = wav_path
+            # Лучше несжатый звук, чем потерянная встреча: короткие записи
+            # пройдут в Groq и так, длинные отсечёт size guard в worker'е
+            # с внятной ошибкой (а PCM-мастер останется для ручного спасения).
+            wav_path = self.output_dir / "audio.wav"
+            pcm_to_wav(self.pcm_path, wav_path)
+            audio_for_whisper = wav_path
 
         speakers_path = self.output_dir / "speaker-timeline.json"
         speakers_path.write_text(json.dumps(self.speakers, ensure_ascii=False, indent=2))
 
         return {
             "rtms_stream_id": self.rtms_stream_id,
-            "wav_path": str(wav_path),
-            "wav_for_whisper": str(wav_for_whisper),
+            "audio_for_whisper": str(audio_for_whisper),
             "pcm_path": str(self.pcm_path),
             "speakers_path": str(speakers_path),
             "speakers": self.speakers,
             "started_at": self.started_at,
             "audio_bytes_count": audio_bytes_count,
-            "duration_sec": audio_bytes_count / (AUDIO_SAMPLE_RATE * 2),
+            "duration_sec": duration_sec,
         }

@@ -2,6 +2,12 @@
 import os
 import requests
 
+# Лимит Groq на размер загружаемого файла — 25 MB; держим 1 MB запаса
+# на multipart-оверхед. Opus 16k mono достигает лимита только после
+# ~3 часов записи; несжатый WAV — уже после ~13 минут (исторический
+# источник HTTP 413 и потерянных встреч).
+MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+
 
 def transcribe(
     audio_path: str,
@@ -13,7 +19,19 @@ def transcribe(
     `prompt` grounds Whisper on proper names, technical terms, and punctuation
     style — significantly improves Russian-language recognition of names and
     project terminology. See default_meeting_prompt() for the standard context.
+
+    Raises ValueError before upload if the file exceeds MAX_UPLOAD_BYTES —
+    fail loud с понятной причиной вместо HTTP 413 от Groq.
     """
+    size = os.path.getsize(audio_path)
+    if size > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"audio file is {size} bytes — exceeds Groq upload limit "
+            f"({MAX_UPLOAD_BYTES} bytes). Запись длиннее ~3 часов в Opus 16k "
+            f"или компрессия не отработала (WAV fallback?). Сырой PCM сохранён "
+            f"рядом для ручного восстановления."
+        )
+
     data = {
         "model": "whisper-large-v3",
         "response_format": "verbose_json",
