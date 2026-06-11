@@ -31,7 +31,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import github_commit, kv, r2_backup, render
+from . import alerts, github_commit, kv, r2_backup, render
 from .groq_whisper import default_meeting_prompt, transcribe
 
 log = logging.getLogger(__name__)
@@ -150,6 +150,10 @@ def _do_work(job: dict) -> dict:
             )
         except Exception as e:
             log.warning("rtms.r2_backup failed (non-fatal): %s", e)
+            alerts.send_alert(
+                f"⚠️ Get Context: R2-бэкап не прошёл для встречи "
+                f"{rtms_stream_id}: {e}\nЗапись цела на VPS, но без off-site копии."
+            )
     elif not r2_backup.is_configured():
         log.info("rtms.r2_backup skipped (R2_* env not configured)")
 
@@ -283,6 +287,19 @@ def _worker_main(job: dict):
             kv.mark_failed(key, job, err)
         except Exception as ke:
             log.error("rtms.kv.mark_failed_error stream=%s err=%s", rtms_stream_id, ke)
+        # Алертим только когда есть что терять: запись захвачена, но
+        # обработка окончательно встала. Фейлы самого захвата (no frames
+        # на чужих/пустых встречах) не алертим — там нечего спасать.
+        output_dir = Path(TMP_BASE) / "rtms" / rtms_stream_id
+        if (
+            job.get("attempts", 0) >= kv.MAX_ATTEMPTS
+            and _read_marker(output_dir, "capture") is not None
+        ):
+            alerts.send_alert(
+                f"🔴 Get Context: запись захвачена, но обработка окончательно "
+                f"упала\nstream: {rtms_stream_id}\nошибка: {err}\n"
+                f"артефакты: {output_dir} на VPS + R2 (7 дней на спасение)"
+            )
         sys.exit(1)
 
 
