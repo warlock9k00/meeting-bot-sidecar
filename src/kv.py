@@ -24,6 +24,11 @@ import os
 import json
 import requests
 
+# Единый лимит ретраев для обоих путей (Attendee и RTMS). После исчерпания
+# job переводится в терминальный статус dead (mark_dead) и перестаёт
+# возвращаться из list_pending_* — иначе зомби листаются каждый poll вечно.
+MAX_ATTEMPTS = 3
+
 
 def _base_url():
     acct = os.environ["CF_ACCOUNT_ID"]
@@ -112,6 +117,14 @@ def mark_failed(bot_id: str, job: dict, error: str) -> None:
     job["last_error"] = error
     job["failed_at"] = _now()
     job["attempts"] = job.get("attempts", 0) + 1
+    put_job(bot_id, job)
+
+
+def mark_dead(bot_id: str, job: dict) -> None:
+    """Терминальный статус: попытки исчерпаны, ретраев больше не будет.
+    last_error последней попытки сохраняется в job для post-mortem."""
+    job["status"] = "dead"
+    job["dead_at"] = _now()
     put_job(bot_id, job)
 
 

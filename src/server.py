@@ -21,7 +21,6 @@ log = logging.getLogger("sidecar.server")
 
 SIDECAR_TOKEN = os.environ.get("SIDECAR_TOKEN", "")
 PORT = int(os.environ.get("PORT", "8082"))
-MAX_ATTEMPTS = 3
 
 
 # ─── Worker queue (single-threaded processing, FIFO) ─────────────────────────
@@ -58,7 +57,7 @@ def _process_one(bot_id: str):
     if job.get("status") == "done":
         log.info("bot_id=%s already done — skip", bot_id)
         return
-    if job.get("attempts", 0) >= MAX_ATTEMPTS:
+    if job.get("attempts", 0) >= kv.MAX_ATTEMPTS:
         log.warning("bot_id=%s max attempts reached — skip", bot_id)
         return
     try:

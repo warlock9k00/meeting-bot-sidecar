@@ -26,7 +26,15 @@ logging.basicConfig(
 )
 log = logging.getLogger("sidecar")
 
-MAX_ATTEMPTS = 3
+
+def _bury(key: str, job: dict, label: str) -> None:
+    """Перевести исчерпавший попытки job в терминальный dead — один раз,
+    вместо вечного skip-warning на каждом poll'е (33 зомби спамили лог)."""
+    log.warning("%s: %s исчерпал попытки → dead", label, key)
+    try:
+        kv.mark_dead(key, job)
+    except Exception as e:
+        log.error("%s: mark_dead failed key=%s err=%s", label, key, e)
 
 
 def safety_tick():
@@ -41,8 +49,8 @@ def safety_tick():
     log.info("safety poll: found %d pending job(s)", len(jobs))
     for job in jobs:
         bot_id = job["bot_id"]
-        if job.get("attempts", 0) >= MAX_ATTEMPTS:
-            log.warning("safety: skip %s — max attempts reached", bot_id)
+        if job.get("attempts", 0) >= kv.MAX_ATTEMPTS:
+            _bury(bot_id, job, "safety")
             continue
         # Reuse the server's queue + dedup so a job won't be processed twice.
         enqueued = server.enqueue(bot_id)
@@ -67,8 +75,8 @@ def rtms_safety_tick():
     log.info("rtms poll: found %d pending job(s)", len(jobs))
     for job in jobs:
         stream_id = job.get("rtms_stream_id", "unknown")
-        if job.get("attempts", 0) >= MAX_ATTEMPTS:
-            log.warning("rtms: skip %s — max attempts reached", stream_id)
+        if job.get("attempts", 0) >= kv.MAX_ATTEMPTS:
+            _bury(f"job:rtms:{stream_id}", job, "rtms")
             continue
         enqueued = server.enqueue_rtms_job(job)
         log.info("rtms: enqueued stream=%s (was_inflight=%s)", stream_id, not enqueued)
