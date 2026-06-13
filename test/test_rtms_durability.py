@@ -50,9 +50,10 @@ def test_pcm_to_wav_empty(tmp_path: Path):
         assert wf.getnframes() == 0
 
 
-def test_frame_size_is_bytes_not_samples():
-    # 16000 Hz × 20ms × 2 bytes = 640 байт (не 320 сэмплов)
-    assert AUDIO_FRAME_SIZE == 640
+def test_frame_size_is_samples():
+    # SDK ждёт число сэмплов: 16000 Hz × 20ms = 320. Эмпирически с 640
+    # приём фреймов ломается (no audio frames). См. Task #17.
+    assert AUDIO_FRAME_SIZE == 320
 
 
 def test_measure_mean_dbfs_silence_vs_signal(tmp_path: Path):

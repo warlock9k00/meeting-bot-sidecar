@@ -20,12 +20,13 @@ from pathlib import Path
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_DURATION_MS = 20
-# frame_size — размер кадра В БАЙТАХ, не в сэмплах:
-#   16000 Hz × 0.020 s × 1 channel × 2 bytes/sample (L16) = 640 байт.
-# Раньше стояло 320 (число сэмплов) — рассинхрон с тем, что ждёт SDK; одна
-# из гипотез silent-capture бага (mixed stream отдавал нули). См.
-# .agent-state/research/zoom-rtms-silent-audio-footguns-20260613.md
-AUDIO_FRAME_SIZE = AUDIO_SAMPLE_RATE * AUDIO_DURATION_MS // 1000 * 2  # 640
+# frame_size = число СЭМПЛОВ на кадр: 16000 Hz × 0.020 s = 320.
+# ПРОВЕРЕНО эмпирически: с 320 фреймы приходят (49 успешных захватов
+# май–июнь), с 640 (попытка трактовать как байты) приём фреймов ломается
+# полностью — «no audio frames within 30s» (тест 2026-06-13 06:55).
+# Silent-capture баг (пустые фреймы) — НЕ про frame_size, причина в
+# режиме mixed-stream. См. research-отчёт + Task #17.
+AUDIO_FRAME_SIZE = AUDIO_SAMPLE_RATE * AUDIO_DURATION_MS // 1000  # 320
 
 # Кадры приходят каждые 20 мс → 50 кадров/сек. Flush на диск каждые 250
 # кадров (~5 сек): при краше процесса теряем максимум 5 секунд звука.
