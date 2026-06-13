@@ -178,9 +178,11 @@ def _do_work(job: dict) -> dict:
     # ── Стадия 2: транскрипция (результат кэшируется на диск) ──
     whisper = _read_marker(output_dir, "transcript")
     if whisper is None:
+        # language не задаём — Whisper auto-detect (RU/EN/смешанные встречи;
+        # хардкод "ru" ломал англоязычную речь). prompt с именами/терминами
+        # остаётся как контекст-подсказка.
         whisper = transcribe(
             capture["audio_for_whisper"],
-            language="ru",
             prompt=default_meeting_prompt(),
         )
         _write_marker(output_dir, "transcript", whisper)

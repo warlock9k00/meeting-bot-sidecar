@@ -11,14 +11,20 @@ MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 
 def transcribe(
     audio_path: str,
-    language: str = "ru",
+    language: str | None = None,
     prompt: str | None = None,
 ) -> dict:
     """Return verbose_json with segments [{start, end, text}, ...].
 
+    `language=None` (по умолчанию) — Whisper сам определяет язык. Раньше был
+    хардкод "ru", из-за чего англоязычные и смешанные встречи расшифровывались
+    кашей (Whisper насильно транскрибировал английский кириллицей: «CDN» →
+    «Сидон», «old source» → «Олдосор»). Auto-detect выбирает доминирующий язык
+    файла — корректно для моноязычных RU и EN встреч. Задать язык явно можно
+    через параметр, если он заранее известен.
+
     `prompt` grounds Whisper on proper names, technical terms, and punctuation
-    style — significantly improves Russian-language recognition of names and
-    project terminology. See default_meeting_prompt() for the standard context.
+    style. See default_meeting_prompt() for the standard context.
 
     Raises ValueError before upload if the file exceeds MAX_UPLOAD_BYTES —
     fail loud с понятной причиной вместо HTTP 413 от Groq.
@@ -35,8 +41,9 @@ def transcribe(
     data = {
         "model": "whisper-large-v3",
         "response_format": "verbose_json",
-        "language": language,
     }
+    if language is not None:
+        data["language"] = language
     if prompt is not None:
         data["prompt"] = prompt
 
