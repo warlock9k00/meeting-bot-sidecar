@@ -12,7 +12,8 @@ from src.rtms_session import (
     AUDIO_FRAME_SIZE,
     AUDIO_SAMPLE_RATE,
     OPUS_BITRATE,
-    build_compress_cmd,
+    _extract_participant_key,
+    build_mix_cmd,
     measure_mean_dbfs,
     pcm_to_wav,
 )
@@ -72,14 +73,36 @@ def test_measure_mean_dbfs_silence_vs_signal(tmp_path: Path):
     assert db_loud is not None and db_loud > -20
 
 
-def test_build_compress_cmd_flags(tmp_path: Path):
-    cmd = build_compress_cmd(tmp_path / "raw.pcm", tmp_path / "audio.ogg")
-    # raw PCM требует явного формата на входе
-    assert ["-f", "s16le"] == cmd[cmd.index("-f"):cmd.index("-f") + 2]
-    assert "libopus" in cmd
-    assert OPUS_BITRATE in cmd
-    assert "loudnorm" in " ".join(cmd)
+def test_build_mix_cmd_single_stream(tmp_path: Path):
+    # Один поток → amix не нужен, только loudnorm
+    cmd = build_mix_cmd([tmp_path / "s1.pcm"], tmp_path / "audio.ogg")
+    joined = " ".join(cmd)
+    assert "amix" not in joined
+    assert "loudnorm" in joined
+    assert "libopus" in cmd and OPUS_BITRATE in cmd
     assert cmd[-1].endswith("audio.ogg")
+
+
+def test_build_mix_cmd_multi_stream(tmp_path: Path):
+    # Несколько потоков → amix с normalize=0, два входа -i
+    cmd = build_mix_cmd([tmp_path / "s1.pcm", tmp_path / "s2.pcm"], tmp_path / "audio.ogg")
+    joined = " ".join(cmd)
+    assert "amix=inputs=2" in joined
+    assert "normalize=0" in joined
+    assert cmd.count("-i") == 2
+
+
+def test_extract_participant_key():
+    class Meta:
+        user_id = 42
+    # объект с user_id
+    assert _extract_participant_key((b"audio", Meta())) == "u42"
+    # dict с userId
+    assert _extract_participant_key((b"audio", {"userId": 7})) == "u7"
+    # только bytes — fallback в один поток
+    assert _extract_participant_key((b"audio",)) == "stream0"
+    # целочисленный канал среди args
+    assert _extract_participant_key((b"audio", 3)) == "c3"
 
 
 def test_transcribe_rejects_oversized_file(tmp_path: Path):

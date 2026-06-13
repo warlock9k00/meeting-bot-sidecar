@@ -122,9 +122,10 @@ def _do_work(job: dict) -> dict:
         capture = session.finalize()
         mean_dbfs = capture.get("mean_dbfs")
         log.info(
-            "rtms.session.done bytes=%d duration=%.1fs speakers=%d mean_dbfs=%s",
+            "rtms.session.done bytes=%d duration=%.1fs streams=%d speakers=%d mean_dbfs=%s",
             capture["audio_bytes_count"],
             capture["duration_sec"],
+            capture.get("participant_streams", 0),
             len(capture["speakers"]),
             f"{mean_dbfs:.1f}" if mean_dbfs is not None else "n/a",
         )

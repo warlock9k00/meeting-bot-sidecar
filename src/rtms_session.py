@@ -1,31 +1,37 @@
-"""RTMS session — capture audio + speaker timeline from one Zoom RTMS stream.
+"""RTMS session — capture per-participant audio from one Zoom RTMS stream.
 
-Wraps native zoom/rtms SDK with synchronous join_and_capture() API. Audio
-стримится на диск инкрементально (raw PCM 16kHz mono int16 LE) — краш
-процесса посреди встречи теряет максимум несколько секунд звука, а не всю
-встречу. Speaker events collected with absolute timestamps. On onLeave or
-timeout, finalize() encodes WAV + runs ffmpeg loudnorm, returning paths +
-speaker timeline for downstream alignment with Whisper segments.
+Wraps native zoom/rtms SDK with synchronous join_and_capture() API.
+
+Режим AUDIO_MULTI_STREAMS: каждый участник (включая авторизовавшего
+приложение) приходит отдельным потоком. AUDIO_MIXED_STREAM давал тишину,
+когда «слышно от других» было пусто — встреча один-на-один с тихим
+собеседником или встреча, где говорит сам хост, выходили как −91 dBFS
+(пустые фреймы) или вовсе без фреймов. Multi-stream не зависит от
+active-speaker микса. См. Task #17 + research-отчёт 2026-06-13.
+
+Аудио каждого участника стримится в свой PCM-файл на диске — краш
+процесса теряет максимум несколько секунд. finalize() микширует все
+потоки в один моно (ffmpeg amix) + loudnorm → Opus для Whisper.
 
 SDK occasionally segfaults — callers should run each session in a subprocess
 (see rtms_worker.py) for crash isolation.
 """
 import json
+import logging
 import subprocess
 import threading
 import time
 import wave
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 
 AUDIO_SAMPLE_RATE = 16000
 AUDIO_DURATION_MS = 20
 # frame_size = число СЭМПЛОВ на кадр: 16000 Hz × 0.020 s = 320.
-# ПРОВЕРЕНО эмпирически: с 320 фреймы приходят (49 успешных захватов
-# май–июнь), с 640 (попытка трактовать как байты) приём фреймов ломается
-# полностью — «no audio frames within 30s» (тест 2026-06-13 06:55).
-# Silent-capture баг (пустые фреймы) — НЕ про frame_size, причина в
-# режиме mixed-stream. См. research-отчёт + Task #17.
+# ПРОВЕРЕНО эмпирически: с 320 фреймы приходят, с 640 (трактовка как байты)
+# приём ломается полностью — «no audio frames within 30s» (тест 06-13 06:55).
 AUDIO_FRAME_SIZE = AUDIO_SAMPLE_RATE * AUDIO_DURATION_MS // 1000  # 320
 
 # Кадры приходят каждые 20 мс → 50 кадров/сек. Flush на диск каждые 250
@@ -37,8 +43,7 @@ FLUSH_EVERY_FRAMES = 250
 LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
 # Opus 16 kbps mono ≈ 7 MB/час. Час несжатого PCM ≈ 115 MB и не влезает в
-# лимит Groq на файл (25 MB) — главный исторический убийца длинных встреч
-# (HTTP 413 Payload Too Large, 26 потерянных записей за май–июнь 2026).
+# лимит Groq на файл (25 MB) — исторический убийца длинных встреч (HTTP 413).
 OPUS_BITRATE = "16k"
 
 # Таймаут компрессии: база + длительность/фактор. loudnorm+opus работает
@@ -51,8 +56,7 @@ DEFAULT_TIMEOUT_SEC = 7200
 # Fail-fast on connection failure: rtms SDK raises errors in its event loop
 # thread, not in the calling thread — client.join() returns successfully even
 # when alloc/join actually failed. onAudioData fires every 20ms while the
-# stream is alive (regardless of silence vs speech), so 30s without frames
-# means the connection never established.
+# stream is alive, so 30s without frames means the connection never established.
 INITIAL_AUDIO_TIMEOUT_SEC = 30
 
 
@@ -67,25 +71,29 @@ def pcm_to_wav(pcm_path: Path, wav_path: Path) -> None:
                 wf.writeframes(chunk)
 
 
-def build_compress_cmd(pcm_path: Path, ogg_path: Path) -> list[str]:
-    """ffmpeg: raw PCM → loudnorm → Opus 16 kbps mono, один проход."""
-    return [
-        "ffmpeg", "-y",
-        "-f", "s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
-        "-i", str(pcm_path),
-        "-af", LOUDNORM_FILTER,
-        "-c:a", "libopus", "-b:a", OPUS_BITRATE,
-        str(ogg_path),
-    ]
+def build_mix_cmd(pcm_paths: list[Path], out_ogg: Path) -> list[str]:
+    """ffmpeg: N raw-PCM потоков участников → amix → loudnorm → Opus mono.
+
+    amix normalize=0 — не делить громкость на число входов (иначе на каждом
+    добавленном участнике микс становится тише). При одном потоке amix не
+    нужен, применяем только loudnorm."""
+    cmd: list[str] = ["ffmpeg", "-y"]
+    for p in pcm_paths:
+        cmd += ["-f", "s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1", "-i", str(p)]
+    n = len(pcm_paths)
+    if n == 1:
+        filt = LOUDNORM_FILTER
+    else:
+        filt = f"amix=inputs={n}:duration=longest:normalize=0,{LOUDNORM_FILTER}"
+    cmd += ["-filter_complex", filt, "-c:a", "libopus", "-b:a", OPUS_BITRATE, str(out_ogg)]
+    return cmd
 
 
 def measure_mean_dbfs(pcm_path: Path) -> float | None:
     """Средняя громкость сырого PCM в dBFS через ffmpeg volumedetect.
 
-    Диагностика silent-capture: −91 dB ≈ цифровая тишина (Zoom отдал
-    пустые фреймы), нормальная речь ≈ −30…−15 dB. Возвращает None если
-    ffmpeg недоступен/упал. Парсит сырой PCM напрямую — меряем то, что
-    реально пришло из RTMS, до всякого loudnorm."""
+    Диагностика silent-capture: −91 dB ≈ цифровая тишина, нормальная речь
+    ≈ −30…−15 dB. Возвращает None если ffmpeg недоступен/упал."""
     try:
         r = subprocess.run(
             ["ffmpeg", "-f", "s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
@@ -100,8 +108,48 @@ def measure_mean_dbfs(pcm_path: Path) -> float | None:
     return None
 
 
+def _extract_participant_key(args: tuple) -> str:
+    """Достать идентификатор участника из аргументов onAudioData.
+
+    SDK варьирует форму callback между релизами и режимами; ищем user_id /
+    user_name на объекте-метадате, в dict, либо целочисленный id среди
+    позиционных. Fallback 'stream0' — всё в один поток (хуже, но не теряем)."""
+    for a in args:
+        uid = getattr(a, "user_id", None)
+        if uid is not None:
+            return f"u{uid}"
+        uname = getattr(a, "user_name", None)
+        if uname:
+            return f"n{uname}"
+    for a in args:
+        if isinstance(a, dict):
+            uid = a.get("user_id") or a.get("userId") or a.get("user_name") or a.get("userName")
+            if uid:
+                return f"u{uid}"
+    # bytes — это аудио, не id; берём первый int как id канала (multi-stream).
+    saw_bytes = False
+    for a in args:
+        if isinstance(a, (bytes, bytearray, memoryview)):
+            saw_bytes = True
+            continue
+        if isinstance(a, int):
+            return f"c{a}"
+    return "stream0" if saw_bytes else "stream0"
+
+
+class _ParticipantStream:
+    """Один PCM-файл на участника, открытый в append для resume-устойчивости."""
+
+    def __init__(self, output_dir: Path, key: str):
+        # Имя файла безопасно для ФС: только хэш ключа.
+        safe = str(abs(hash(key)) % (10 ** 12))
+        self.path = output_dir / f"stream_{safe}.pcm"
+        self.file = self.path.open("ab")
+        self.bytes_count = 0
+
+
 class RtmsSession:
-    """One Zoom RTMS stream — capture audio + speakers, стримя PCM на диск."""
+    """One Zoom RTMS stream — per-participant audio capture стримом на диск."""
 
     def __init__(self, payload: dict, output_dir: Path):
         # Lazy import: native SDK не нужен для импорта модуля (тесты helpers
@@ -116,14 +164,10 @@ class RtmsSession:
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.pcm_path = self.output_dir / "raw_audio.pcm"
-        # Append: если SDK сегфолтнулся посреди живой встречи и ретрай
-        # пере-джойнится, частичная запись первой попытки сохраняется
-        # (склейка с дырой лучше, чем потеря начала встречи).
-        self._pcm_file = self.pcm_path.open("ab")
-        self._pcm_lock = threading.Lock()
-        self.audio_bytes_count = 0
+        self._streams: dict[str, _ParticipantStream] = {}
+        self._streams_lock = threading.Lock()
         self._frames_since_flush = 0
+        self._logged_shape = False
 
         self.speakers: list[dict] = []
         self.started_at: float = 0.0
@@ -139,31 +183,46 @@ class RtmsSession:
             codec=rtms.AudioCodec["L16"],
             sample_rate=rtms.AudioSampleRate["SR_16K"],
             channel=rtms.AudioChannel["MONO"],
-            data_opt=rtms.AudioDataOption["AUDIO_MIXED_STREAM"],
+            data_opt=rtms.AudioDataOption["AUDIO_MULTI_STREAMS"],
             duration=AUDIO_DURATION_MS,
             frame_size=AUDIO_FRAME_SIZE,
         )
         self.client.setAudioParams(audio_params)
 
-        # SDK varies arg count/types between releases — universal *args
-        # extraction is more robust than positional signature.
         @self.client.onAudioData
         def _on_audio(*args, **kwargs):
+            # Один раз логируем форму callback'а — чтобы post-hoc свериться,
+            # что participant-id извлекается правильно (формат SDK не в доках).
+            if not self._logged_shape:
+                self._logged_shape = True
+                shape = [type(a).__name__ for a in args]
+                log.info("rtms.audio.callback_shape args=%s kwargs=%s",
+                         shape, list(kwargs.keys()))
+
+            data = None
             for a in args:
                 if isinstance(a, (bytes, bytearray, memoryview)):
                     data = bytes(a)
-                    with self._pcm_lock:
-                        if self._pcm_file.closed:
-                            return
-                        if self._first_audio_at is None:
-                            self._first_audio_at = time.time()
-                        self._pcm_file.write(data)
-                        self.audio_bytes_count += len(data)
-                        self._frames_since_flush += 1
-                        if self._frames_since_flush >= FLUSH_EVERY_FRAMES:
-                            self._pcm_file.flush()
-                            self._frames_since_flush = 0
+                    break
+            if not data:
+                return
+            key = _extract_participant_key(args)
+
+            with self._streams_lock:
+                st = self._streams.get(key)
+                if st is None:
+                    st = _ParticipantStream(self.output_dir, key)
+                    self._streams[key] = st
+                if st.file.closed:
                     return
+                if self._first_audio_at is None:
+                    self._first_audio_at = time.time()
+                st.file.write(data)
+                st.bytes_count += len(data)
+                self._frames_since_flush += 1
+                if self._frames_since_flush >= FLUSH_EVERY_FRAMES:
+                    st.file.flush()
+                    self._frames_since_flush = 0
 
         @self.client.onActiveSpeakerEvent
         def _on_speaker(*args, **kwargs):
@@ -191,9 +250,7 @@ class RtmsSession:
 
         Raises RuntimeError if no audio arrives within INITIAL_AUDIO_TIMEOUT_SEC
         — protects against silent SDK join failures (errors in event loop thread
-        don't propagate to caller). Without this check, a bad payload would
-        block for the full DEFAULT_TIMEOUT_SEC (2 hours).
-        """
+        don't propagate to caller)."""
         self._setup_callbacks()
         self.started_at = time.time()
         self.client.join(self.payload)
@@ -217,45 +274,53 @@ class RtmsSession:
         self._done.wait(timeout=timeout)
 
     def finalize(self) -> dict:
-        """Закрыть PCM-файл, сжать в Opus (loudnorm + 16k mono) для Whisper.
-        Fallback на plain WAV если ffmpeg недоступен или упал."""
-        with self._pcm_lock:
-            if not self._pcm_file.closed:
-                self._pcm_file.flush()
-                self._pcm_file.close()
+        """Закрыть потоки участников, смикшировать в один моно Opus для Whisper.
+        Fallback на конкатенацию PCM→WAV если ffmpeg недоступен или упал."""
+        with self._streams_lock:
+            for st in self._streams.values():
+                if not st.file.closed:
+                    st.file.flush()
+                    st.file.close()
 
-        audio_bytes_count = self.pcm_path.stat().st_size
-        duration_sec = audio_bytes_count / (AUDIO_SAMPLE_RATE * 2)
+        pcm_paths = [st.path for st in self._streams.values() if st.path.stat().st_size > 0]
+        total_bytes = sum(p.stat().st_size for p in pcm_paths)
+        # Длительность по самому длинному потоку (участники говорят не подряд).
+        max_bytes = max((p.stat().st_size for p in pcm_paths), default=0)
+        duration_sec = max_bytes / (AUDIO_SAMPLE_RATE * 2)
 
         ogg_path = self.output_dir / "audio.ogg"
-        timeout = COMPRESS_TIMEOUT_BASE_SEC + int(duration_sec / COMPRESS_SPEED_FACTOR)
-        try:
-            subprocess.run(
-                build_compress_cmd(self.pcm_path, ogg_path),
-                check=True, capture_output=True, timeout=timeout,
-            )
-            audio_for_whisper = ogg_path
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-            # Лучше несжатый звук, чем потерянная встреча: короткие записи
-            # пройдут в Groq и так, длинные отсечёт size guard в worker'е
-            # с внятной ошибкой (а PCM-мастер останется для ручного спасения).
-            wav_path = self.output_dir / "audio.wav"
-            pcm_to_wav(self.pcm_path, wav_path)
-            audio_for_whisper = wav_path
+        audio_for_whisper: Path | None = None
+        if pcm_paths:
+            timeout = COMPRESS_TIMEOUT_BASE_SEC + int(duration_sec / COMPRESS_SPEED_FACTOR)
+            try:
+                subprocess.run(
+                    build_mix_cmd(pcm_paths, ogg_path),
+                    check=True, capture_output=True, timeout=timeout,
+                )
+                audio_for_whisper = ogg_path
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+                log.warning("rtms.mix failed, fallback to first stream WAV: %s", e)
+                wav_path = self.output_dir / "audio.wav"
+                pcm_to_wav(pcm_paths[0], wav_path)
+                audio_for_whisper = wav_path
 
         speakers_path = self.output_dir / "speaker-timeline.json"
         speakers_path.write_text(json.dumps(self.speakers, ensure_ascii=False, indent=2))
 
-        mean_dbfs = measure_mean_dbfs(self.pcm_path)
+        # Диагностику меряем на СЫРЫХ потоках до loudnorm (иначе нормализация
+        # замаскирует тишину) и берём самый громкий — если даже он почти
+        # пуст, вся встреча пришла тишиной.
+        per_stream_db = [d for d in (measure_mean_dbfs(p) for p in pcm_paths) if d is not None]
+        mean_dbfs = max(per_stream_db) if per_stream_db else None
 
         return {
             "rtms_stream_id": self.rtms_stream_id,
-            "audio_for_whisper": str(audio_for_whisper),
-            "pcm_path": str(self.pcm_path),
+            "audio_for_whisper": str(audio_for_whisper) if audio_for_whisper else "",
+            "participant_streams": len(pcm_paths),
             "speakers_path": str(speakers_path),
             "speakers": self.speakers,
             "started_at": self.started_at,
-            "audio_bytes_count": audio_bytes_count,
+            "audio_bytes_count": total_bytes,
             "duration_sec": duration_sec,
             "mean_dbfs": mean_dbfs,
         }
