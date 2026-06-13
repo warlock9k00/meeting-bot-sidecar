@@ -282,6 +282,7 @@ def _worker_main(job: dict):
     )
     rtms_stream_id = job.get("rtms_stream_id", "unknown")
     key = f"job:rtms:{rtms_stream_id}"
+    t_start = time.time()
 
     try:
         kv.mark_processing(key, job)
@@ -305,19 +306,24 @@ def _worker_main(job: dict):
             kv.mark_failed(key, job, err)
         except Exception as ke:
             log.error("rtms.kv.mark_failed_error stream=%s err=%s", rtms_stream_id, ke)
-        # Алертим только когда есть что терять: запись захвачена, но
-        # обработка окончательно встала. Фейлы самого захвата (no frames
-        # на чужих/пустых встречах) не алертим — там нечего спасать.
         output_dir = Path(TMP_BASE) / "rtms" / rtms_stream_id
-        if (
-            job.get("attempts", 0) >= kv.MAX_ATTEMPTS
-            and _read_marker(output_dir, "capture") is not None
-        ):
+        last_attempt = job.get("attempts", 0) >= kv.MAX_ATTEMPTS
+        # Случай 1: запись захвачена, но обработка окончательно встала —
+        # есть что спасать (артефакты на VPS + R2).
+        if last_attempt and _read_marker(output_dir, "capture") is not None:
             alerts.send_alert(
                 f"🔴 Get Context: запись захвачена, но обработка окончательно "
                 f"упала\nstream: {rtms_stream_id}\nошибка: {err}\n"
                 f"артефакты: {output_dir} на VPS + R2 (7 дней на спасение)"
             )
+        # Случай 2: фреймов не было — проверяем не отказ ли это авторизации
+        # media-gateway (960). Это значит RTMS не работает в принципе
+        # (несовпадение креды/app), оператору надо знать сразу.
+        elif last_attempt and "no audio frames" in err:
+            from .rtms_session import detect_media_auth_failure
+            reason = detect_media_auth_failure(t_start)
+            if reason:
+                alerts.send_alert(f"🔴 Get Context: RTMS не работает.\n{reason}")
         sys.exit(1)
 
 

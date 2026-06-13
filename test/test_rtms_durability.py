@@ -14,6 +14,7 @@ from src.rtms_session import (
     OPUS_BITRATE,
     _extract_participant_key,
     build_mix_cmd,
+    detect_media_auth_failure,
     measure_mean_dbfs,
     pcm_to_wav,
 )
@@ -90,6 +91,25 @@ def test_build_mix_cmd_multi_stream(tmp_path: Path):
     assert "amix=inputs=2" in joined
     assert "normalize=0" in joined
     assert cmd.count("-i") == 2
+
+
+def test_detect_media_auth_failure(tmp_path: Path):
+    import time
+    t0 = time.time()
+    # Лог с маркером 960 → детект срабатывает
+    bad = tmp_path / "python_131_x.log"
+    bad.write_bytes(b"... ZSSGW_SDK rtms_sdk_impl::on_session_start, failed, reason: 960 ...")
+    reason = detect_media_auth_failure(t0, logs_dir=tmp_path)
+    assert reason is not None and "960" in reason
+
+    # Чистый лог без маркера → None
+    other = tmp_path / "clean"
+    other.mkdir()
+    (other / "python_99_x.log").write_bytes(b"... Successfully joined, audio frames flowing ...")
+    assert detect_media_auth_failure(t0, logs_dir=other) is None
+
+    # Нет папки → None, не падаем
+    assert detect_media_auth_failure(t0, logs_dir=tmp_path / "nope") is None
 
 
 def test_extract_participant_key():

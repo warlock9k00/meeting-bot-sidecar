@@ -17,6 +17,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 
+# Нативный rtms SDK пишет диагностику в /app/logs/python_<pid>_*.log.
+# Без этой папки — errno=2 спам и потеря критичных логов (media gateway
+# reject 960 и т.п.). Создаём заранее, чтобы диагностика была всегда.
+RUN mkdir -p /app/logs
+
 ENV PYTHONUNBUFFERED=1 PYTHONPATH=/app
 
 EXPOSE 8082

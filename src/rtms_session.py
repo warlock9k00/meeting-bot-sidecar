@@ -108,6 +108,42 @@ def measure_mean_dbfs(pcm_path: Path) -> float | None:
     return None
 
 
+SDK_LOG_DIR = Path("/app/logs")
+# Маркеры отказа media-gateway в нативном логе SDK. reason: 960 = шлюз
+# отверг handshake (несовпадение client_id/secret подписи, истёкший
+# RTMS-доступ). Подробности: research-отчёт zoom-rtms-960-error.
+_AUTH_FAIL_MARKERS = ("on_session_start, failed", "reason: 960")
+
+
+def detect_media_auth_failure(since_ts: float, logs_dir: Path = SDK_LOG_DIR) -> str | None:
+    """Просканировать свежие нативные SDK-логи на отказ авторизации media-сессии.
+
+    Возвращает строку-причину если найден reason 960 / session_start failed
+    (джойн прошёл, но шлюз отверг подпись — самый частый «Successfully joined
+    но нет аудио»), иначе None. since_ts — отсекаем старые логи по mtime."""
+    try:
+        if not logs_dir.is_dir():
+            return None
+        recent = [p for p in logs_dir.glob("python_*.log")
+                  if p.stat().st_mtime >= since_ts - 5]
+        for p in sorted(recent, key=lambda x: x.stat().st_mtime, reverse=True):
+            try:
+                blob = p.read_bytes()
+            except OSError:
+                continue
+            for marker in _AUTH_FAIL_MARKERS:
+                if marker.encode() in blob:
+                    return (
+                        "Zoom media-gateway отверг авторизацию RTMS "
+                        "(on_session_start reason 960). Обычно причина — "
+                        "несовпадение client_id/secret установленного app и "
+                        "ZM_RTMS_* в .env, либо истёкший RTMS-доступ аккаунта."
+                    )
+    except OSError:
+        pass
+    return None
+
+
 def _extract_participant_key(args: tuple) -> str:
     """Достать идентификатор участника из аргументов onAudioData.
 
