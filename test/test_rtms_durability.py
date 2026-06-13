@@ -9,9 +9,11 @@ import pytest
 
 from src.groq_whisper import MAX_UPLOAD_BYTES, transcribe
 from src.rtms_session import (
+    AUDIO_FRAME_SIZE,
     AUDIO_SAMPLE_RATE,
     OPUS_BITRATE,
     build_compress_cmd,
+    measure_mean_dbfs,
     pcm_to_wav,
 )
 from src.rtms_worker import (
@@ -46,6 +48,27 @@ def test_pcm_to_wav_empty(tmp_path: Path):
 
     with wave.open(str(wav), "rb") as wf:
         assert wf.getnframes() == 0
+
+
+def test_frame_size_is_bytes_not_samples():
+    # 16000 Hz × 20ms × 2 bytes = 640 байт (не 320 сэмплов)
+    assert AUDIO_FRAME_SIZE == 640
+
+
+def test_measure_mean_dbfs_silence_vs_signal(tmp_path: Path):
+    # Цифровая тишина: все нули → очень низкий dBFS (или -inf → None при парсе)
+    silent = tmp_path / "silent.pcm"
+    silent.write_bytes(b"\x00\x00" * AUDIO_SAMPLE_RATE)  # 1 сек нулей
+    db_silent = measure_mean_dbfs(silent)
+    # ffmpeg на чистых нулях может вернуть -91 или -inf (None) — оба = тишина
+    assert db_silent is None or db_silent < -80
+
+    # Громкий сигнал: близкие к пику сэмплы → высокий dBFS
+    import struct
+    loud = tmp_path / "loud.pcm"
+    loud.write_bytes(struct.pack("<" + "h" * AUDIO_SAMPLE_RATE, *([20000] * AUDIO_SAMPLE_RATE)))
+    db_loud = measure_mean_dbfs(loud)
+    assert db_loud is not None and db_loud > -20
 
 
 def test_build_compress_cmd_flags(tmp_path: Path):

@@ -19,8 +19,13 @@ from pathlib import Path
 
 
 AUDIO_SAMPLE_RATE = 16000
-AUDIO_FRAME_SIZE = 320  # 16000 Hz × 20ms × mono
 AUDIO_DURATION_MS = 20
+# frame_size — размер кадра В БАЙТАХ, не в сэмплах:
+#   16000 Hz × 0.020 s × 1 channel × 2 bytes/sample (L16) = 640 байт.
+# Раньше стояло 320 (число сэмплов) — рассинхрон с тем, что ждёт SDK; одна
+# из гипотез silent-capture бага (mixed stream отдавал нули). См.
+# .agent-state/research/zoom-rtms-silent-audio-footguns-20260613.md
+AUDIO_FRAME_SIZE = AUDIO_SAMPLE_RATE * AUDIO_DURATION_MS // 1000 * 2  # 640
 
 # Кадры приходят каждые 20 мс → 50 кадров/сек. Flush на диск каждые 250
 # кадров (~5 сек): при краше процесса теряем максимум 5 секунд звука.
@@ -71,6 +76,27 @@ def build_compress_cmd(pcm_path: Path, ogg_path: Path) -> list[str]:
         "-c:a", "libopus", "-b:a", OPUS_BITRATE,
         str(ogg_path),
     ]
+
+
+def measure_mean_dbfs(pcm_path: Path) -> float | None:
+    """Средняя громкость сырого PCM в dBFS через ffmpeg volumedetect.
+
+    Диагностика silent-capture: −91 dB ≈ цифровая тишина (Zoom отдал
+    пустые фреймы), нормальная речь ≈ −30…−15 dB. Возвращает None если
+    ffmpeg недоступен/упал. Парсит сырой PCM напрямую — меряем то, что
+    реально пришло из RTMS, до всякого loudnorm."""
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-f", "s16le", "-ar", str(AUDIO_SAMPLE_RATE), "-ac", "1",
+             "-i", str(pcm_path), "-af", "volumedetect", "-f", "null", "/dev/null"],
+            capture_output=True, text=True, timeout=120,
+        )
+        for line in r.stderr.splitlines():
+            if "mean_volume:" in line:
+                return float(line.split("mean_volume:")[1].strip().split()[0])
+    except (subprocess.SubprocessError, ValueError, IndexError, FileNotFoundError):
+        pass
+    return None
 
 
 class RtmsSession:
@@ -219,6 +245,8 @@ class RtmsSession:
         speakers_path = self.output_dir / "speaker-timeline.json"
         speakers_path.write_text(json.dumps(self.speakers, ensure_ascii=False, indent=2))
 
+        mean_dbfs = measure_mean_dbfs(self.pcm_path)
+
         return {
             "rtms_stream_id": self.rtms_stream_id,
             "audio_for_whisper": str(audio_for_whisper),
@@ -228,4 +256,5 @@ class RtmsSession:
             "started_at": self.started_at,
             "audio_bytes_count": audio_bytes_count,
             "duration_sec": duration_sec,
+            "mean_dbfs": mean_dbfs,
         }

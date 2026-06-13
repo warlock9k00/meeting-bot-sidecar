@@ -50,6 +50,11 @@ TMP_BASE = os.environ.get("TMP_DIR", "/tmp/sidecar")
 # синхронно с 7-дневным lifecycle R2-бакета meeting-audio-backup.
 GC_MAX_AGE_DAYS = 7
 
+# Порог «почти тишина» в dBFS. Нормальная речь ≈ −30…−15; цифровой ноль
+# Zoom-фреймов даёт ≈ −91. −80 ловит пустой захват, не задевая тихие
+# но реальные записи.
+SILENCE_DBFS_THRESHOLD = -80.0
+
 
 def _marker_path(output_dir: Path, name: str) -> Path:
     return output_dir / f"{name}.json"
@@ -115,14 +120,26 @@ def _do_work(job: dict) -> dict:
         session = RtmsSession(job["payload"], output_dir)
         session.join_and_capture(timeout=DEFAULT_TIMEOUT_SEC)
         capture = session.finalize()
+        mean_dbfs = capture.get("mean_dbfs")
         log.info(
-            "rtms.session.done bytes=%d duration=%.1fs speakers=%d",
+            "rtms.session.done bytes=%d duration=%.1fs speakers=%d mean_dbfs=%s",
             capture["audio_bytes_count"],
             capture["duration_sec"],
             len(capture["speakers"]),
+            f"{mean_dbfs:.1f}" if mean_dbfs is not None else "n/a",
         )
         if capture["audio_bytes_count"] == 0:
             raise RuntimeError("no audio captured (empty session)")
+        # Диагностика silent-capture: −80 dBFS и ниже = практически цифровая
+        # тишина (Zoom отдал пустые фреймы при живом потоке). Запись цела,
+        # но транскрипт будет мусором — алертим, чтобы не молчать.
+        if mean_dbfs is not None and mean_dbfs < SILENCE_DBFS_THRESHOLD:
+            alerts.send_alert(
+                f"🔇 Get Context: захват вышел почти тишиной ({mean_dbfs:.0f} dBFS) "
+                f"на встрече {rtms_stream_id} ({capture['duration_sec']:.0f}с). "
+                f"RTMS отдал пустой звук — транскрипт будет неточным. "
+                f"Аудио в R2 для разбора."
+            )
         _write_marker(output_dir, "capture", capture)
     else:
         log.info(
