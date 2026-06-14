@@ -63,3 +63,34 @@ def event_timestamps(bot: dict) -> tuple[str, str]:
     if not ended:
         ended = events[-1]["created_at"]
     return started, ended
+
+
+def create_bot(
+    meeting_url: str,
+    obf_connection_user_id: str,
+    bot_name: str = "Get Context",
+) -> str:
+    """Create an Attendee bot that joins meeting_url using an OBF token.
+
+    OBF (On Behalf Of) lets the bot join meetings hosted by EXTERNAL accounts:
+    Attendee mints the token from a managed Zoom OAuth connection. The
+    authorizing user must already be in the meeting (Zoom OBF constraint);
+    Attendee retries join until presence is satisfied.
+    """
+    payload = {
+        "meeting_url": meeting_url,
+        "bot_name": bot_name,
+        "zoom_settings": {
+            "onbehalf_token": {
+                "zoom_oauth_connection_user_id": obf_connection_user_id,
+            }
+        },
+    }
+    r = requests.post(
+        f"{_base()}/api/v1/bots",
+        headers={**_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()["id"]
