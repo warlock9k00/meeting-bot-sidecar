@@ -94,3 +94,36 @@ def create_bot(
     )
     r.raise_for_status()
     return r.json()["id"]
+
+
+def create_zoom_oauth_connection(
+    authorization_code: str,
+    redirect_uri: str,
+    zoom_oauth_app_id: str | None = None,
+    onbehalf: bool = True,
+) -> dict:
+    """Create a managed Zoom OAuth connection in Attendee from an OAuth code.
+
+    Attendee exchanges the authorization_code for Zoom tokens server-side and
+    fetches the Zoom user. The returned connection's `user_id` is the value to
+    pass as obf_connection_user_id when creating bots (see create_bot).
+
+    redirect_uri must match the URI registered on the Zoom OAuth app and used
+    to obtain the code. zoom_oauth_app_id is optional when only one Zoom OAuth
+    app is registered in the Attendee project.
+    """
+    payload = {
+        "authorization_code": authorization_code,
+        "redirect_uri": redirect_uri,
+        "is_onbehalf_token_supported": onbehalf,
+    }
+    if zoom_oauth_app_id:
+        payload["zoom_oauth_app_id"] = zoom_oauth_app_id
+    r = requests.post(
+        f"{_base()}/api/v1/zoom_oauth_connections",
+        headers={**_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()
